@@ -1,3 +1,6 @@
 [submodule "data"]
 	path = data
 	url = https://github.com/lanl/scico-data.git
+[submodule "flow_matching"]
+	path = flow_matching
+	url = https://github.com/facebookresearch/flow_matching.git
