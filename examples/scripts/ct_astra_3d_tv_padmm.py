@@ -53,6 +53,10 @@ vectors = angle_to_vector(det_spacing, angles)
 # in this case (since vectors is just computed directly from these two quantities), but
 # the more general form is used here as a demonstration.
 C = XRayTransform3D(tangle.shape, det_count=det_count, vectors=vectors)  # CT projection operator
+
+print("shape of tangle is: ", tangle.shape)
+print("shape of C is: ", C.shape)
+
 y = C @ tangle  # sinogram
 
 
@@ -93,7 +97,8 @@ gradient sub-iterations used by the ADMM solver in the
 𝛼 = 1e2  # improve problem conditioning by balancing C and D components of A
 λ = 2e0 / 𝛼  # ℓ2,1 norm regularization parameter
 ρ = 5e-3  # ADMM penalty parameter
-maxiter = 1000  # number of ADMM iterations
+# maxiter = 1000  # number of ADMM iterations
+maxiter = 1
 
 f = functional.ZeroFunctional()
 g0 = loss.SquaredL2Loss(y=y)
@@ -102,6 +107,8 @@ g = functional.SeparableFunctional((g0, g1))
 D = linop.FiniteDifference(input_shape=tangle.shape, append=0)
 
 A = linop.VerticalStack((C, 𝛼 * D))
+
+
 mu, nu = ProximalADMM.estimate_parameters(A)
 
 solver = ProximalADMM(
