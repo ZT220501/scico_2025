@@ -16,10 +16,11 @@ from ._ladmm import LinearizedADMM
 from .pgm import PGM, AcceleratedPGM
 from ._primaldual import PDHG
 from ._padmm import ProximalADMM, NonLinearPADMM, ProximalADMMBase
-
+from ._sparseadmm import SparseADMM
 
 __all__ = [
     "ADMM",
+    "SparseADMM",
     "LinearizedADMM",
     "ProximalADMM",
     "ProximalADMMBase",

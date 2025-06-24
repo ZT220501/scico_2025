@@ -141,6 +141,11 @@ plot.imview(
 )
 fig.show()
 
+import os
+my_path = os.path.dirname(os.path.abspath(__file__))  # Figures out the absolute path for you in case your working directory moves around.
+
+plot.savefig(os.path.join(my_path, "results/ct_svmbir_ppp_bm3d_admm_cg.png"))
+
 
 """
 Plot convergence statistics.
@@ -152,6 +157,8 @@ plot.plot(
     xlbl="Iteration",
     lgnd=("Primal", "Dual"),
 )
+
+plot.savefig(os.path.join(my_path, "results/ct_svmbir_ppp_bm3d_admm_cg_residuals.png"))
 
 
 input("\nWaiting for input to close figures and exit")

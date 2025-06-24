@@ -71,6 +71,8 @@ from scico.numpy.util import is_real_dtype
 from scico.typing import BlockShape, DType, Shape
 from scipy import optimize as spopt
 
+from jax.experimental.sparse import BCOO
+
 
 def _wrap_func(func: Callable, shape: Union[Shape, BlockShape], dtype: DType) -> Callable:
     """Function evaluation for use in :mod:`scipy.optimize`.
@@ -373,6 +375,104 @@ def cg(
         return (x, {"num_iter": ii, "rel_res": snp.sqrt(num).real / bn})
     else:
         return x
+    
+
+
+
+def cg_sparse(
+    A: Callable,
+    b: Array,
+    x0: Optional[BCOO] = None,
+    *,
+    tol: float = 1e-5,
+    atol: float = 0.0,
+    maxiter: int = 1000,
+    info: bool = True,
+    M: Optional[Callable] = None,
+) -> Tuple[Array, dict]:
+    r"""Conjugate Gradient solver for sparse x0.
+
+    Solve the linear system :math:`A\mb{x} = \mb{b}`, where :math:`A` is
+    positive definite, via the conjugate gradient method.
+
+    Args:
+        A: Callable implementing linear operator :math:`A`, which should
+           be positive definite.
+        b: Input array :math:`\mb{b}`.
+        x0: Initial solution, in sparse format. If `A` is a 
+          :class:`.LinearOperator`, this parameter need not be specified, 
+          and defaults to a zero array in sparse format.
+          Otherwise, it is required to be a BCOO array.
+        tol: Relative residual stopping tolerance. Convergence occurs
+           when `norm(residual) <= max(tol * norm(b), atol)`.
+        atol: Absolute residual stopping tolerance. Convergence occurs
+           when `norm(residual) <= max(tol * norm(b), atol)`.
+        maxiter: Maximum iterations. Default: 1000.
+        info: If ``True`` return a tuple consting of the solution array
+           and a dictionary containing diagnostic information, otherwise
+           just return the solution.
+        M: Preconditioner for `A`. The preconditioner should approximate
+           the inverse of `A`. The default, ``None``, uses no
+           preconditioner.
+
+    Returns:
+        tuple: A tuple (x, info) containing:
+
+            - **x** : Solution array.
+            - **info**: Dictionary containing diagnostic information.
+    """
+    if x0 is None:
+        if isinstance(A, LinearOperator):
+            # Sparse x0 initialization
+            x0 = BCOO.fromdense(snp.zeros(A.input_shape, b.dtype))
+        else:
+            raise ValueError("Parameter x0 must be specified if A is not a LinearOperator")
+
+    if M is None:
+        M = lambda x: x
+
+
+    # The operations are done in sparse format below
+    x = x0
+    Ax = A(x0)
+    bn = snp.linalg.norm(b)
+    r = BCOO.fromdense(b) - Ax
+    z = M(r)
+    p = z
+
+    r_conj = BCOO((r.data.conj(), r.indices), shape=r.shape)
+    num = snp.sum(r_conj * z)
+    ii = 0
+
+    # termination tolerance (uses the "non-legacy" form of scicpy.sparse.linalg.cg)
+    termination_tol_sq = snp.maximum(tol * bn, atol) ** 2
+
+    while (ii < maxiter) and (num > termination_tol_sq):
+        Ap = A(p)
+        p_conj = BCOO((p.data.conj(), p.indices), shape=p.shape)
+        Ap_conj = BCOO((Ap.data.conj(), Ap.indices), shape=Ap.shape)
+        alpha = num / snp.sum(p_conj * Ap_conj)
+        x = x + alpha * p
+        r = r - alpha * Ap
+        z = M(r)
+        num_old = num
+        r_conj = BCOO((r.data.conj(), r.indices), shape=r.shape)
+        num = snp.sum(r_conj * z)
+        beta = num / num_old
+        p = z + beta * p
+        ii += 1
+
+    if info:
+        return (x, {"num_iter": ii, "rel_res": snp.sqrt(num).real / bn})
+    else:
+        return x
+
+
+
+
+
+
+
 
 
 def lstsq(

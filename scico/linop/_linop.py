@@ -287,6 +287,7 @@ class LinearOperator(Operator):
                :class:`LinearOperator`, must have
                `x.output_shape == self.input_shape`.
         """
+
         if isinstance(x, LinearOperator):
             return ComposedLinearOperator(self, x)
         # Use Operator __call__ for LinearOperator @ array or LinearOperator @ Operator
@@ -465,6 +466,10 @@ class ComposedLinearOperator(LinearOperator):
                 :meth:`~.LinearOperator.jit` after the
                 :class:`LinearOperator` is created.
         """
+
+        print("I'm in the ComposedLinearOperator init.")
+
+
         if not isinstance(A, LinearOperator):
             raise TypeError(
                 "The first argument to ComposedLinearOperator must be a LinearOperator; "

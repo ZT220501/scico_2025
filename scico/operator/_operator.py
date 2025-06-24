@@ -216,7 +216,7 @@ output_dtype : {self.output_dtype}
                 f"Cannot evaluate {type(self)} with input_shape={self.input_shape} "
                 f"on array with shape={x.shape}."
             )
-
+        
         return self._eval(x)
 
     def __add__(self, other: Operator) -> Operator:

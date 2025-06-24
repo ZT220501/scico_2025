@@ -5,12 +5,12 @@
 # user license can be found in the 'LICENSE' file distributed with the
 # package.
 
-"""ADMM solver."""
+"""Sparse ADMM solver."""
 
 # Needed to annotate a class method that returns the encapsulating class;
 # see https://www.python.org/dev/peps/pep-0563/
 from __future__ import annotations
-
+from jax.experimental.sparse import BCOO
 from typing import List, Optional, Tuple, Union
 
 import scico.numpy as snp
@@ -30,8 +30,9 @@ from ._admmaux import (
 from ._common import Optimizer
 
 
-class ParallelADMM(Optimizer):
-    r"""Parallel Alternating Direction Method of Multipliers (ADMM) algorithm.
+class SparseADMM(Optimizer):
+    r"""Sparse Alternating Direction Method of Multipliers (ADMM) algorithm.
+    In this implementation, the input :math:`\mb{x}` is represented as a sparse vector.
 
     |
 
@@ -141,7 +142,9 @@ class ParallelADMM(Optimizer):
             input_shape = C_list[0].input_shape
             dtype = C_list[0].input_dtype
             x0 = snp.zeros(input_shape, dtype=dtype)
-        self.x = x0
+
+        # Sparse representation of x0
+        self.x = BCOO.fromdense(x0)
         self.z_list, self.z_list_old = self.z_init(self.x)
         self.u_list = self.u_init(self.x)
 
@@ -161,7 +164,6 @@ class ParallelADMM(Optimizer):
             + self.u_list
         ):
             if not snp.all(snp.isfinite(v)):
-                print("NaN or Inf value encountered in solve.")
                 return False
         return True
 
@@ -311,6 +313,8 @@ class ParallelADMM(Optimizer):
         Args:
             x0: Initial value of :math:`\mb{x}`.
         """
+
+        # TODO: Figure out how to compute Ci(x0) for sparse x0
         z_list: List[Union[Array, BlockArray]] = [Ci(x0) for Ci in self.C_list]
         z_list_old = z_list.copy()
         return z_list, z_list_old
@@ -329,7 +333,8 @@ class ParallelADMM(Optimizer):
         Args:
             x0: Initial value of :math:`\mb{x}`.
         """
-        u_list = [snp.zeros(Ci.output_shape, dtype=Ci.output_dtype) for Ci in self.C_list]
+        # Create sparse zero array for u_list
+        u_list = [BCOO.fromdense(snp.zeros(Ci.output_shape, dtype=Ci.output_dtype)) for Ci in self.C_list]
         return u_list
 
     def step(self):

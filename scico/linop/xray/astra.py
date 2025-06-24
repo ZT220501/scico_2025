@@ -720,6 +720,9 @@ class XRayTransform3D(LinearOperator):  # pragma: no cover
     def _proj(self, x: jax.Array) -> jax.Array:
         # apply the forward projector and generate a sinogram
 
+        print("I'm in the XRayTransform3D _proj")
+        print("x is: ", x)
+
         def f(x):
             x = _ensure_writeable(x)
             proj_id, result = astra.create_sino3d_gpu(x, self.proj_geom, self.vol_geom)
