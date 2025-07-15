@@ -14,10 +14,12 @@ automatic differentiation and support for GPU devices are not available.
 """
 
 from typing import Optional, Tuple, Union
+from functools import partial
 
 import numpy as np
 
 import jax
+import jax.numpy as jnp
 
 import scico.numpy as snp
 from scico.loss import Loss, SquaredL2Loss
@@ -30,6 +32,8 @@ try:
     import svmbir
 except ImportError:
     raise ImportError("Could not import svmbir; please install it.")
+
+import mbirjax as mj
 
 
 class XRayTransform(LinearOperator):
@@ -301,6 +305,13 @@ class XRayTransform(LinearOperator):
             y,
         )
         return x.reshape(self.input_shape)
+
+
+
+
+
+
+
 
 
 class SVMBIRExtendedLoss(Loss):

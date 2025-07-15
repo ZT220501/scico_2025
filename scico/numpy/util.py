@@ -24,6 +24,7 @@ from scico.typing import ArrayIndex, Axes, AxisIndex, BlockShape, DType, Shape
 
 from ._blockarray import BlockArray
 
+import torch
 
 def transpose_ntpl_of_list(ntpl: NamedTuple) -> List[NamedTuple]:
     """Convert a namedtuple of lists/arrays to a list of namedtuples.
@@ -451,3 +452,28 @@ def is_scalar_equiv(s: Any) -> bool:
         otherwise ``False``.
     """
     return snp.isscalar(s) or (isinstance(s, jax.Array) and s.ndim == 0)
+
+
+
+
+def sparse_jax_to_torch(x_sparse: jax.Array) -> torch.Tensor:
+    """Convert a sparse jax array to a sparsetorch tensor.
+
+    Args:
+        x: Jax array to be converted.
+
+    Returns:
+        Torch tensor.
+    """
+
+    np_indices = np.array(x_sparse.indices.T)  # Transpose to match PyTorch format
+    np_data = np.array(x_sparse.data)
+    np_indices.setflags(write=True)
+    np_data.setflags(write=True)
+
+    shape = x_sparse.shape
+
+    torch_indices = torch.tensor(np_indices, dtype=torch.int32)
+    torch_data = torch.tensor(np_data, dtype=torch.float32)
+
+    return torch.sparse_coo_tensor(torch_indices, torch_data, size=shape)

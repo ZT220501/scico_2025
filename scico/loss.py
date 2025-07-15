@@ -247,7 +247,7 @@ class SquaredL2Loss(Loss):
         r"""Compute the Hessian of linear operator `A`.
 
         If `self.A` is a :class:`scico.linop.LinearOperator`, returns a
-        :class:`scico.linop.LinearOperator` corresponding to  the Hessian
+        :class:`scico.linop.LinearOperator` corresponding to the Hessian
         :math:`2 \alpha \mathrm{A^H W A}`. Otherwise not implemented.
         """
         A = self.A

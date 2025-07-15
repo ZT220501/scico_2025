@@ -62,6 +62,13 @@ from scico.typing import Shape, TypeAlias
 VolumeGeometry: TypeAlias = dict
 ProjectionGeometry: TypeAlias = dict
 
+from jax.experimental.sparse import BCOO
+from scipy.sparse import coo_matrix
+import torch
+from scico.numpy.util import sparse_jax_to_torch
+from functools import partial
+import scico.numpy as snp
+
 
 def set_astra_gpu_index(idx: Union[int, Sequence[int]]):
     """Set the index/indices of GPU(s) to be used by astra.
@@ -720,8 +727,261 @@ class XRayTransform3D(LinearOperator):  # pragma: no cover
     def _proj(self, x: jax.Array) -> jax.Array:
         # apply the forward projector and generate a sinogram
 
-        print("I'm in the XRayTransform3D _proj")
-        print("x is: ", x)
+        def f(x):
+            x = _ensure_writeable(x)
+            proj_id, result = astra.create_sino3d_gpu(x, self.proj_geom, self.vol_geom)
+            astra.data3d.delete(proj_id)
+            return result
+
+        return jax.pure_callback(f, jax.ShapeDtypeStruct(self.output_shape, self.output_dtype), x)
+
+    def _bproj(self, y: jax.Array) -> jax.Array:
+        # apply backprojector
+
+        def f(y):
+            y = _ensure_writeable(y)
+            proj_id, result = astra.create_backprojection3d_gpu(y, self.proj_geom, self.vol_geom)
+            astra.data3d.delete(proj_id)
+            return result
+
+        return jax.pure_callback(f, jax.ShapeDtypeStruct(self.input_shape, self.input_dtype), y)
+
+
+
+class SparseXRayTransform3D(LinearOperator):  # pragma: no cover
+    r"""3D parallel beam X-ray transform based on the ASTRA toolbox.
+
+    Perform tomographic projection (also called X-ray projection) of a
+    volume at specified angles, using the
+    `ASTRA toolbox <https://github.com/astra-toolbox/astra-toolbox>`_.
+    The `3D geometries <https://astra-toolbox.com/docs/geom3d.html#projection-geometries>`__
+    "parallel3d" and "parallel3d_vec" are supported by this interface.
+    Note that a CUDA GPU is required for the primary functionality of
+    this class; if no GPU is available, initialization will fail with a
+    :exc:`RuntimeError`.
+
+    The volume is fixed with respect to the coordinate system, centered
+    at the origin, as illustrated below:
+
+    .. plot:: pyfigures/xray_3d_vol.py
+       :align: center
+       :include-source: False
+       :show-source-link: False
+
+    The voxels sides have unit length (in arbitrary units), which defines
+    the scale for all other dimensions in the source-volume-detector
+    configuration. Geometry axes `z`, `y`, and `x` correspond to volume
+    array axes 0, 1, and 2 respectively. The projected array axes 0, 1,
+    and 2 correspond respectively to detector rows, views, and detector
+    columns.
+
+    In the "parallel3d" case, the source and detector rotate clockwise
+    about the `z` axis in the `x`-`y` plane, as illustrated below:
+
+    .. plot:: pyfigures/xray_3d_ang.py
+       :align: center
+       :include-source: False
+       :show-source-link: False
+       :caption: Each radial arrow indicates the direction of the beam
+          towards the detector (indicated in orange in the "light"
+          display mode) and the arrow parallel to the detector indicates
+          the direction of increasing pixel indices.
+
+    In this case the `z` axis is in the same direction as the
+    vertical/row axis of the detector and its projection corresponds to
+    a vertical line in the center of the horizontal/column detector axis.
+    Note that the view images must be displayed with the origin at the
+    bottom left (i.e. vertically inverted from the top left origin image
+    indexing convention) in order for the projections to correspond to
+    the positive up/negative down orientation of the `z` axis in the
+    figures here.
+
+    In the "parallel3d_vec" case, each view is determined by the following
+    vectors:
+
+    .. list-table:: View definition vectors
+       :widths: 10 90
+
+       * - :math:`\mb{r}`
+         - Direction of the parallel beam
+       * - :math:`\mb{d}`
+         - Center of the detector
+       * - :math:`\mb{u}`
+         - Vector from detector pixel (0,0) to (0,1) (direction of
+           increasing detector column index)
+       * - :math:`\mb{v}`
+         - Vector from detector pixel (0,0) to (1,0) (direction of
+           increasing detector row index)
+
+    Note that the components of these vectors are in `x`, `y`, `z` order,
+    not the `z`, `y`, `x` order of the volume axes.
+
+    .. plot:: pyfigures/xray_3d_vec.py
+       :align: center
+       :include-source: False
+       :show-source-link: False
+
+    Vector :math:`\mb{r}` is not illustrated to avoid cluttering the
+    figure, but will typically be directed toward the center of the
+    detector (i.e. in the direction of :math:`\mb{d}` in the figure.)
+    Since the volume-detector distance does not have a geometric effect
+    for a parallel-beam configuration, :math:`\mb{d}` may be set to the
+    zero vector when the detector and beam centers coincide (e.g., as in
+    the case of the "parallel3d" geometry). Note that the view images
+    must be displayed with the origin at the bottom left (i.e. vertically
+    inverted from the top left origin image indexing convention) in order
+    for the row indexing of the projections to correspond to the
+    direction of :math:`\mb{v}` in the figure.
+
+    These vectors are concatenated into a single row vector
+    :math:`(\mb{r}, \mb{d}, \mb{u}, \mb{v})` to form the full
+    geometry specification for a single view, and multiple such
+    row vectors are stacked to specify the geometry for a set
+    of views.
+    """
+
+    def __init__(
+        self,
+        input_shape: Shape,
+        det_count: Tuple[int, int],
+        det_spacing: Optional[Tuple[float, float]] = None,
+        angles: Optional[np.ndarray] = None,
+        vectors: Optional[np.ndarray] = None,
+    ):
+        """
+        Keyword arguments `det_spacing` and `angles` should be specified
+        to use the "parallel3d" geometry, and keyword argument `vectors`
+        should be specified to use the "parallel3d_vec" geometry. These
+        parameters are mutually exclusive.
+
+        Args:
+            input_shape: Shape of the input array.
+            det_count: Number of detector elements. See the
+               `astra documentation <https://www.astra-toolbox.com/docs/geom3d.html#projection-geometries>`__
+               for more information.
+            det_spacing: Spacing between detector elements. See the
+               `astra documentation <https://www.astra-toolbox.com/docs/geom3d.html#projection-geometries>`__
+               for more information.
+            angles: Array of projection angles in radians. This
+                parameter is  mutually exclusive with `vectors`.
+            vectors: Array of ASTRA geometry specification vectors. This
+                parameter is mutually exclusive with `angles`.
+
+        Raises:
+            RuntimeError: If a CUDA GPU is not available to the ASTRA
+                toolbox.
+        """
+        if not astra.use_cuda():
+            raise RuntimeError("CUDA GPU required but not available or not enabled.")
+
+        if not (
+            (det_spacing is not None and angles is not None and vectors is None)
+            or (vectors is not None and det_spacing is None and angles is None)
+        ):
+            raise ValueError(
+                "Keyword arguments 'det_spacing' and 'angles', or keyword argument "
+                "'vectors' must be specified, but not both."
+            )
+
+        self.num_dims = len(input_shape)
+        if self.num_dims != 3:
+            raise ValueError(
+                f"Only 3D projections are supported, but 'input_shape' is {input_shape}."
+            )
+
+        if not isinstance(det_count, (list, tuple)) or len(det_count) != 2:
+            raise ValueError("Expected parameter 'det_count' to be a tuple with 2 elements.")
+        if angles is not None and vectors is not None:
+            raise ValueError("Parameters 'angles' and 'vectors' are mutually exclusive.")
+        if angles is None and vectors is None:
+            raise ValueError(
+                "Exactly one of the parameters 'angles' and 'vectors' must be provided."
+            )
+        if angles is not None:
+            Nview = angles.size
+            self.angles: Optional[np.ndarray] = np.array(angles)
+            self.vectors: Optional[np.ndarray] = None
+        if vectors is not None:
+            Nview = vectors.shape[0]
+            self.vectors = np.array(vectors)
+            self.angles = None
+        output_shape: Shape = (det_count[0], Nview, det_count[1])
+
+        self.det_count = det_count
+        assert isinstance(det_count, (list, tuple))
+        self.input_shape: tuple = input_shape
+        self.vol_geom, self.proj_geom = self.create_astra_geometry(
+            input_shape,
+            det_count,
+            det_spacing=det_spacing,
+            angles=self.angles,
+            vectors=self.vectors,
+        )
+
+        # Wrap our non-jax function to indicate we will supply fwd/rev mode functions
+        self._eval = jax.custom_vjp(self._proj)
+        self._eval.defvjp(lambda x: (self._proj(x), None), lambda _, y: (self._bproj(y),))  # type: ignore
+        self._adj = jax.custom_vjp(self._bproj)
+        self._adj.defvjp(lambda y: (self._bproj(y), None), lambda _, x: (self._proj(x),))  # type: ignore
+
+        super().__init__(
+            input_shape=self.input_shape,
+            output_shape=output_shape,
+            input_dtype=np.float32,
+            output_dtype=np.float32,
+            adj_fn=self._adj,
+            jit=False,
+        )
+
+    @staticmethod
+    def create_astra_geometry(
+        input_shape: Shape,
+        det_count: Tuple[int, int],
+        det_spacing: Optional[Tuple[float, float]] = None,
+        angles: Optional[np.ndarray] = None,
+        vectors: Optional[np.ndarray] = None,
+    ) -> Tuple[VolumeGeometry, ProjectionGeometry]:
+        """Create ASTRA 3D geometry objects.
+
+        Keyword arguments `det_spacing` and `angles` should be specified
+        to use the "parallel3d" geometry, and keyword argument `vectors`
+        should be specified to use the "parallel3d_vec" geometry. These
+        parameters are mutually exclusive.
+
+        Args:
+            input_shape: Shape of the input array.
+            det_count: Number of detector elements. See the
+               `astra documentation <https://www.astra-toolbox.com/docs/geom3d.html#projection-geometries>`__
+               for more information.
+            det_spacing: Spacing between detector elements. See the
+               `astra documentation <https://www.astra-toolbox.com/docs/geom3d.html#projection-geometries>`__
+               for more information.
+            angles: Array of projection angles in radians.
+            vectors: Array of geometry specification vectors.
+
+        Returns:
+            A tuple `(vol_geom, proj_geom)` of ASTRA volume geometry and
+            projection geometry objects.
+        """
+        vol_geom = astra.create_vol_geom(input_shape[1], input_shape[2], input_shape[0])
+        if angles is not None:
+            assert det_spacing is not None
+            proj_geom = astra.create_proj_geom(
+                "parallel3d",
+                det_spacing[0],
+                det_spacing[1],
+                det_count[0],
+                det_count[1],
+                angles,
+            )
+        else:
+            proj_geom = astra.create_proj_geom(
+                "parallel3d_vec", det_count[0], det_count[1], vectors
+            )
+        return vol_geom, proj_geom
+
+    def _proj(self, x: jax.Array) -> jax.Array:
+        # apply the forward projector and generate a sinogram
 
         def f(x):
             x = _ensure_writeable(x)
@@ -733,6 +993,7 @@ class XRayTransform3D(LinearOperator):  # pragma: no cover
 
     def _bproj(self, y: jax.Array) -> jax.Array:
         # apply backprojector
+
         def f(y):
             y = _ensure_writeable(y)
             proj_id, result = astra.create_backprojection3d_gpu(y, self.proj_geom, self.vol_geom)
@@ -740,6 +1001,153 @@ class XRayTransform3D(LinearOperator):  # pragma: no cover
             return result
 
         return jax.pure_callback(f, jax.ShapeDtypeStruct(self.input_shape, self.input_dtype), y)
+    
+
+
+    @staticmethod
+    def forward_project_pixel_batch_to_full_view(voxel_values, pixel_indices, angles, projector_params):
+        """
+        Apply a parallel beam transformation to a set of voxel cylinders. These cylinders are assumed to have
+        slices aligned with detector rows, so that a parallel beam maps a cylinder slice to a detector row.
+        This function returns the resulting sinogram views for all angles.
+
+        Args:
+            voxel_values (jax array):  2D array of shape (num_pixels, num_recon_slices) of voxel values, where
+                voxel_values[i, j] is the value of the voxel in slice j at the location determined by indices[i].
+            pixel_indices (jax array of int):  1D vector of shape (len(pixel_indices), ) holding the indices into
+                the flattened array of size num_rows x num_cols.
+            angles (jax array of float):  All the angles for the sinogram.
+            projector_params (namedtuple):  tuple of (sinogram_shape, recon_shape, get_geometry_params())
+
+        Returns:
+            jax array of shape (num_det_rows, num_views, num_det_channels)
+        """
+        num_views, num_det_rows, num_det_channels = projector_params.sinogram_shape
+        sinogram = snp.zeros((num_det_rows, num_views, num_det_channels))
+
+        print("Number of angles: ", len(angles))
+        print("Number of views: ", num_views)
+
+        for i in range(num_views):
+            # sinogram[:, i, :] = SparseXRayTransform3D.forward_project_pixel_batch_to_one_view(voxel_values, pixel_indices, angles[i], projector_params)
+            sinogram = sinogram.at[:, i, :].set(SparseXRayTransform3D.forward_project_pixel_batch_to_one_view(voxel_values, pixel_indices, angles[i], projector_params))
+
+        return sinogram
+        
+
+
+
+
+    @staticmethod
+    @partial(jax.jit, static_argnames='projector_params')
+    def forward_project_pixel_batch_to_one_view(voxel_values, pixel_indices, angle, projector_params):
+        """
+        Apply a parallel beam transformation to a set of voxel cylinders. These cylinders are assumed to have
+        slices aligned with detector rows, so that a parallel beam maps a cylinder slice to a detector row.
+        This function returns the resulting sinogram view.
+
+        Args:
+            voxel_values (jax array):  2D array of shape (num_pixels, num_recon_slices) of voxel values, where
+                voxel_values[i, j] is the value of the voxel in slice j at the location determined by indices[i].
+            pixel_indices (jax array of int):  1D vector of shape (len(pixel_indices), ) holding the indices into
+                the flattened array of size num_rows x num_cols.
+            angle (float):  Angle for this view
+            projector_params (namedtuple):  tuple of (sinogram_shape, recon_shape, get_geometry_params())
+
+        Returns:
+            jax array of shape (num_det_rows, num_det_channels)
+        """
+        # Get all the geometry parameters - we use gp since geometry parameters is a named tuple and we'll access
+        # elements using, for example, gp.delta_det_channel, so a longer name would be clumsy.
+        gp = projector_params.geometry_params
+        num_views, num_det_rows, num_det_channels = projector_params.sinogram_shape
+
+        # Get the data needed for horizontal projection
+        n_p, n_p_center, W_p_c, cos_alpha_p_xy = SparseXRayTransform3D.compute_proj_data(pixel_indices, angle, projector_params)
+        L_max = snp.minimum(1.0, W_p_c)
+
+        # Allocate the sinogram array
+        sinogram_view = snp.zeros((num_det_rows, num_det_channels))
+
+        # Do the projection
+        for n_offset in snp.arange(start=-gp.psf_radius, stop=gp.psf_radius+1):
+            n = n_p_center + n_offset
+            abs_delta_p_c_n = snp.abs(n_p - n)
+            L_p_c_n = snp.clip((W_p_c + 1.0) / 2.0 - abs_delta_p_c_n, 0.0, L_max)
+            A_chan_n = gp.delta_voxel * L_p_c_n / cos_alpha_p_xy
+            A_chan_n *= (n >= 0) * (n < num_det_channels)
+            sinogram_view = sinogram_view.at[:, n].add(A_chan_n.reshape((1, -1)) * voxel_values.T)
+
+        return sinogram_view
+    
+
+    @staticmethod
+    def compute_proj_data(pixel_indices, angle, projector_params):
+        """
+        Compute the quantities n_p, n_p_center, W_p_c, cos_alpha_p_xy needed for vertical projection.
+
+        Args:
+            pixel_indices (1D jax array of int):  indices into flattened array of size num_rows x num_cols.
+            angle (float): The projection angle in radians for this view.
+            projector_params (namedtuple): tuple of (sinogram_shape, recon_shape, get_geometry_params()).
+
+        Returns:
+            n_p, n_p_center, W_p_c, cos_alpha_p_xy
+        """
+        # Get all the geometry parameters - we use gp since geometry parameters is a named tuple and we'll access
+        # elements using, for example, gp.delta_det_channel, so a longer name would be clumsy.
+        gp = projector_params.geometry_params
+
+        num_views, num_det_rows, num_det_channels = projector_params.sinogram_shape
+        recon_shape = projector_params.recon_shape
+
+        # Convert the index into (i,j,k) coordinates corresponding to the indices into the 3D voxel array
+        row_index, col_index = snp.unravel_index(pixel_indices, recon_shape[:2])
+
+        x_p = SparseXRayTransform3D.recon_ij_to_x(row_index, col_index, gp.delta_voxel, recon_shape, angle)
+
+        det_center_channel = (num_det_channels - 1) / 2.0  # num_of_cols
+
+        # Calculate indices on the detector grid
+        n_p = (x_p + gp.det_channel_offset) / gp.delta_det_channel + det_center_channel
+        n_p_center = snp.round(n_p).astype(int)
+
+        # Compute cos alpha for row and columns
+        cos_alpha_p_xy = snp.maximum(snp.abs(snp.cos(angle)),
+                                     snp.abs(snp.sin(angle)))
+
+        # Compute projected voxel width along columns and rows (in fraction of detector size)
+        W_p_c = (gp.delta_voxel / gp.delta_det_channel) * cos_alpha_p_xy
+
+        proj_data = (n_p, n_p_center, W_p_c, cos_alpha_p_xy)
+
+        return proj_data
+
+    @staticmethod
+    def recon_ij_to_x(i, j, delta_voxel, recon_shape, angle):
+        """
+        Convert (i, j, k) indices into the recon volume to corresponding (x, y, z) coordinates.
+        """
+        # Extract the dimensions of the recon volume, compatible with scico
+        num_recon_slices, num_recon_rows, num_recon_cols = recon_shape
+
+        # Compute the un-rotated coordinates relative to iso
+        # Note the change in order from (i, j) to (y, x)!!
+        y_tilde = delta_voxel * (i - (num_recon_rows - 1) / 2.0)
+        x_tilde = delta_voxel * (j - (num_recon_cols - 1) / 2.0)
+
+        # Precompute cosine and sine of view angle, then do the rotation
+        cos = snp.cos(angle)  # length = num_views
+        sin = snp.sin(angle)  # length = num_views
+
+        x = cos * x_tilde + sin * y_tilde
+        y = -sin * x_tilde + cos * y_tilde
+
+        return x
+
+
+
+
 
 
 def angle_to_vector(det_spacing: Tuple[float, float], angles: np.ndarray) -> np.ndarray:
@@ -781,8 +1189,9 @@ def rotate_vectors(vectors: np.ndarray, rot: Rotation) -> np.ndarray:
     return rot_vecs
 
 
-def _ensure_writeable(x):
+def _ensure_writeable(x, sparse=False):
     """Ensure that `x.flags.writeable` is ``True``, copying if needed."""
+
     if hasattr(x, "flags"):  # x is a numpy array
         if not x.flags.writeable:
             try:
@@ -790,5 +1199,10 @@ def _ensure_writeable(x):
             except ValueError:
                 x = x.copy()
     else:  # x is a jax array (which is immutable)
-        x = np.array(x)
+        if sparse:
+            x = sparse_jax_to_torch(x)
+        else:
+            x = np.array(x)
     return x
+
+

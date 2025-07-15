@@ -27,6 +27,8 @@ from scico.numpy.util import is_complex_dtype
 from scico.operator._operator import Operator, _wrap_mul_div_scalar
 from scico.typing import BlockShape, DType, Shape
 
+import torch
+
 
 def _wrap_add_sub(func: Callable) -> Callable:
     r"""Wrapper function for defining `__add__` and `__sub__`.
@@ -314,16 +316,17 @@ class LinearOperator(Operator):
         if self._adj is None:
             self._set_adjoint()
 
-        if isinstance(y, LinearOperator):
-            return ComposedLinearOperator(self.H, y)
-        if self.output_dtype != y.dtype:
-            raise ValueError(f"Dtype error: expected {self.output_dtype}, got {y.dtype}.")
-        if self.output_shape != y.shape:
-            raise ValueError(
-                f"""Shapes do not conform: input array with shape {y.shape} does not match
-                LinearOperator output_shape {self.output_shape}."""
-            )
-        assert self._adj is not None
+        # if isinstance(y, LinearOperator):
+        #     return ComposedLinearOperator(self.H, y)
+        # if self.output_dtype != y.dtype:
+        #     raise ValueError(f"Dtype error: expected {self.output_dtype}, got {y.dtype}.")
+        # if self.output_shape != y.shape:
+        #     raise ValueError(
+        #         f"""Shapes do not conform: input array with shape {y.shape} does not match
+        #         LinearOperator output_shape {self.output_shape}."""
+        #     )
+        # assert self._adj is not None
+        
         return self._adj(y)
 
     @property
