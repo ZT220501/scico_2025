@@ -469,10 +469,6 @@ class ComposedLinearOperator(LinearOperator):
                 :meth:`~.LinearOperator.jit` after the
                 :class:`LinearOperator` is created.
         """
-
-        print("I'm in the ComposedLinearOperator init.")
-
-
         if not isinstance(A, LinearOperator):
             raise TypeError(
                 "The first argument to ComposedLinearOperator must be a LinearOperator; "

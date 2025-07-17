@@ -348,16 +348,6 @@ class ProximalADMM(ProximalADMMBase):
 
         Perform a single algorithm iteration.
         """
-
-        print("I'm in the proximal admm step.")
-        print("Shape of self.A is: ", self.A.shape)
-        print("Shape of self.B is: ", self.B.shape)
-        print("Shape of self.x is: ", self.x.shape)
-        print("Shape of self.z is: ", self.z.shape)
-        print("Shape of self.u is: ", self.u.shape)
-
-
-
         proxarg = self.x - (1.0 / self.mu) * self.A.H(2.0 * self.u - self.u_old)
         self.x = self.f.prox(proxarg, (1.0 / (self.rho * self.mu)), v0=self.x)
         proxarg = self.z - (1.0 / self.nu) * self.B.H(
