@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import io
 import socket
 import urllib.error as urlerror
@@ -181,6 +182,43 @@ def url_get(url: str, maxtry: int = 3, timeout: int = 10) -> io.BytesIO:  # prag
                 raise
 
     return io.BytesIO(cntnt)
+
+
+
+def create_roi_indices(Nx, Ny, roi_start_row, roi_end_row, roi_start_col, roi_end_col, display=False):
+    '''
+    Create ROI indices for a row and column range used in the scico MBIRJAX wrapper.
+    
+    Args:
+        Nx: Image width
+        Ny: Image height
+        roi_start_row: Start row index of the ROI
+        roi_end_row: End row index of the ROI
+        roi_start_col: Start column index of the ROI
+        roi_end_col: End column index of the ROI
+        display: Whether to display the ROI indices, default is False
+    
+    Returns:
+        roi_indices: ROI indices
+    '''
+    # Check the validity of the ROI indices
+    if roi_start_row < 0 or roi_end_row > Nx or roi_start_col < 0 or roi_end_col > Ny:
+        raise ValueError("ROI start and end indices must be within the image dimensions")
+    if roi_start_row >= roi_end_row or roi_start_col >= roi_end_col:
+        raise ValueError("ROI start indices must be strictly less than end indices")
+
+    # Create ROI indices
+    roi_rows = np.arange(roi_start_row, roi_end_row)
+    roi_cols = np.arange(roi_start_col, roi_end_col)
+    roi_row_grid, roi_col_grid = np.meshgrid(roi_rows, roi_cols, indexing='ij')
+    roi_indices = np.ravel_multi_index((roi_row_grid.flatten(), roi_col_grid.flatten()), (Nx, Ny))
+    
+    if display:
+        print(f"ROI indices: {roi_indices}")
+        print(f"ROI indices shape: {roi_indices.shape}")
+        print(f"ROI coverage: {len(roi_indices)} / {Nx * Ny} = {len(roi_indices) / (Nx * Ny) * 100:.1f}%")
+    
+    return roi_indices
 
 
 # Timer classes are copied from https://github.com/bwohlberg/sporco
