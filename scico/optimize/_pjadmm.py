@@ -21,6 +21,7 @@ from scico.numpy.linalg import norm
 from scico.optimize.admm import ADMM
 from scico import functional, linop, loss, metric, plot
 from scico.util import Timer
+import jax
 
 from ._admmaux import (
     FBlockCircularConvolveSolver,
@@ -33,8 +34,11 @@ from ._admmaux import (
 from ._common import Optimizer
 
 
-class DecentralizedADMM:
-    r"""Decentralized Alternating Direction Method of Multipliers (ADMM) algorithm.
+
+# TODO: If this turns out to be effective, try Jacobi ADMM+correction step, or ADAL.
+class ProxJacobiADMM(Optimizer):
+    r"""Proximal Jacobi Alternating Direction Method of Multipliers (ADMM) algorithm.
+    For reference, see https://link.springer.com/article/10.1007/s10915-016-0318-2.
 
     |
 
@@ -99,15 +103,23 @@ class DecentralizedADMM:
         self,
         A_list: List[LinearOperator],
         g_list: List[Functional],
-        D_list: List[LinearOperator],
-        rho_list: List[float],
+        ρ: float,
         y: Array,
-        alpha: float = 1.0,
+        τ: float,
+        γ: float,
+        c: float,
+        λ: Optional[Array] = None,
         x0_list: Optional[List[Union[Array, BlockArray]]] = None,
         cg_tol: float = 1e-4,
         cg_maxiter: int = 25,
         display_period: int = 5,
-        maxiter_per_block: int = 25,
+        device: str = "gpu",
+        with_correction: bool = False,
+        α: float = None,
+        test_mode: bool = False,
+        ground_truth: Optional[Array] = None,
+        row_division_num: int = 4,
+        col_division_num: int = 8,
         **kwargs,
     ):
         r"""Initialize an :class:`ADMM` object.
@@ -130,69 +142,71 @@ class DecentralizedADMM:
             **kwargs: Additional optional parameters handled by
                 initializer of base class :class:`.Optimizer`.
         """
+        self.device = device
         self.N = len(A_list)
-        if len(A_list) != self.N:
-            raise ValueError(f"len(A_list)={len(A_list)} not equal to len(g_list)={self.N}.")
-        if len(D_list) != self.N:
-            raise ValueError(f"len(D_list)={len(D_list)} not equal to len(g_list)={self.N}.")
-        # if len(rho_list) != self.N:
-        #     raise ValueError(f"len(rho_list)={len(rho_list)} not equal to len(g_list)={self.N}.")
+        if len(g_list) != self.N:
+            raise ValueError(f"len(g_list)={len(g_list)} not equal to len(A_list)={self.N}.")
+        
+        if not with_correction and α is not None:
+            raise ValueError("alpha is only used when with_correction is True.")
+        if with_correction and α is None:
+            self.α = 1 - snp.sqrt(self.N / (self.N + 1))
+        else:
+            self.α: float = α
 
-        iter0 = kwargs.pop("iter0", 0)
-        self.maxiter: int = kwargs.pop("maxiter", 0)
-        self.nanstop: bool = kwargs.pop("nanstop", False)
-        itstat_options = kwargs.pop("itstat_options", None)
+        if test_mode and ground_truth is None:
+            raise ValueError("ground_truth is required in test mode.")
+        if not test_mode and ground_truth is not None:
+            raise ValueError("ground_truth is only used in test mode.")
+        self.test_mode: bool = test_mode
+        self.ground_truth: Optional[Array] = ground_truth
 
-        if kwargs:
-            raise TypeError(f"Unrecognized keyword argument(s) {', '.join([k for k in kwargs])}")
-
-        self.itnum: int = iter0
-        self.timer: Timer = Timer()
 
         self.A_list: List[LinearOperator] = A_list      # List of partial forward sinogram projection operators typically.
-        self.g_list: List[Functional] = g_list          # List of L21 regularizers typically.
-        self.D_list: List[LinearOperator] = D_list      # List of finite difference operators typically.
-        self.rho_list: List[float] = rho_list            # List of ADMM penalty parameters typically. Currently, all the penalty parameters are the SAME.
-        self.alpha: float = alpha                        # Relaxation parameter typically.
+        self.g_list: List[Functional] = g_list          # List of TV regularizers typically.
+
+        self.ρ: float = ρ                               # ADMM penalty parameter.
         self.y: Array = y                                # Ground truth full sinogram.
-        self.alpha: float = alpha                        # Relaxation parameter typically.
-        self.maxiter_per_block: int = maxiter_per_block  # Maximum number of iterations for each block.
+        self.γ: float = γ                                # Damping parameter.
+        self.τ: float = τ                                # Proximal weight.
+        self.c: float = c                                # TV weight.
         self.display_period: int = display_period        # Display period for the ADMM solver.
+        self.with_correction: bool = with_correction    # Whether to use the correction term.
+
+        if λ is None:
+            self.λ = snp.zeros(A_list[0].output_shape, dtype=A_list[0].output_dtype)
+        else:
+            self.λ = λ
+        self.λ = jax.device_put(self.λ, self.device)
+        self.λ_prev = self.λ.copy()
 
         self.cg_tol: float = cg_tol
         self.cg_maxiter: int = cg_maxiter
 
         if x0_list is None:
-            input_shape = D_list[0].input_shape
-            dtype = D_list[0].input_dtype
-            x0_list = [snp.zeros(input_shape, dtype=dtype) for _ in range(self.N)]
+            input_shape = A_list[0].input_shape
+            dtype = A_list[0].input_dtype
+            self.x_list = [snp.zeros(input_shape, dtype=dtype) for _ in range(self.N)]
+        else:
+            self.x_list = x0_list
+        self.x_list = [snp.array(jax.device_put(x, self.device)) for x in self.x_list]
+        self.x_list_two_prev = self.x_list.copy()
+        self.x_list_prev = self.x_list.copy()
 
-        # Important notice: Here the x-update is the proximal operator update,
-        # while the z_avg-update is the CG update.
-        self.x_list = x0_list
-        self.Ax_avg = y / self.N
-        self.z_avg = y          # Notice that the initial value of z_avg is not important, since in the following-up steps,
-                                # there will be a closed-form solution for z_avg that doesn't depend on the previous value of z_avg.
-        self.u_avg = snp.zeros(A_list[0].output_shape, dtype=A_list[0].output_dtype)
+        self.res = sum(self.A_list[i](self.x_list[i]) for i in range(self.N)) - self.y
+        self.res = jax.device_put(self.res, self.device)
+        self.res_two_prev = self.res.copy()
+        self.res_prev = self.res.copy()
 
-        print("Initializing ADMM solvers for each block...")
-        self.ADMM_list = []
-        for i in range(self.N):
-            y_i = self.A_list[i](x0_list[i].copy()) + self.z_avg - self.Ax_avg - self.u_avg
-            block_solver = ADMM(
-                f = loss.SquaredL2Loss(y=y_i.copy(), A=self.A_list[i]), 
-                g_list = [self.g_list[0]],                  # Assume for now that g_list only contains one element, which is λ * functional.L21Norm()
-                C_list = [self.D_list[i]],                  # Contains the finite difference operators for each block.
-                rho_list = [self.rho_list[0]],              # Assume for now that rho_list only contains one element, which is ρ.
-                alpha = alpha, 
-                x0 = x0_list[i].copy(), 
-                maxiter = self.maxiter_per_block,
-                subproblem_solver = LinearSubproblemSolver(cg_kwargs={"tol": self.cg_tol, "maxiter": self.cg_maxiter}),
-                itstat_options={"display": True, "period": self.display_period}
-            )
-            self.ADMM_list.append(block_solver)
+        self.res_all = [norm(self.res.reshape(-1), ord=2)]
+        self.x_all = [self.x_list.copy()]
 
-        print("DecentralizedADMM initialized successfully.")
+        self.row_division_num: int = row_division_num
+        self.col_division_num: int = col_division_num
+
+        super().__init__(**kwargs)
+
+
 
     def _working_vars_finite(self) -> bool:
         """Determine where ``NaN`` of ``Inf`` encountered in solve.
@@ -213,34 +227,13 @@ class DecentralizedADMM:
 
     def _objective_evaluatable(self):
         """Determine whether the objective function can be evaluated."""
-        return (not self.f or self.f.has_eval) and all([_.has_eval for _ in self.g_list])
+        # return all([_.has_eval for _ in self.A_list]) and all([_.has_eval for _ in self.g_list])
+        return True
 
     def _itstat_extra_fields(self):
         """Define ADMM-specific iteration statistics fields."""
-        itstat_fields = {"Prml Rsdl": "%9.3e", "Dual Rsdl": "%9.3e"}
-        itstat_attrib = ["norm_primal_residual()", "norm_dual_residual()"]
-
-        # subproblem solver info when available
-        if isinstance(self.subproblem_solver, GenericSubproblemSolver):
-            itstat_fields.update({"Num FEv": "%6d", "Num It": "%6d"})
-            itstat_attrib.extend(
-                ["subproblem_solver.info['nfev']", "subproblem_solver.info['nit']"]
-            )
-        elif (
-            type(self.subproblem_solver) == LinearSubproblemSolver
-            and self.subproblem_solver.cg_function == "scico"
-        ):
-            itstat_fields.update({"CG It": "%5d", "CG Res": "%9.3e"})
-            itstat_attrib.extend(
-                ["subproblem_solver.info['num_iter']", "subproblem_solver.info['rel_res']"]
-            )
-        elif (
-            type(self.subproblem_solver)
-            in [MatrixSubproblemSolver, FBlockCircularConvolveSolver, G0BlockCircularConvolveSolver]
-            and self.subproblem_solver.check_solve
-        ):
-            itstat_fields.update({"Slv Res": "%9.3e"})
-            itstat_attrib.extend(["subproblem_solver.accuracy"])
+        itstat_fields = {"Prml Rsdl": "%9.3e", "Dual Rsdl": "%9.3e", "SNR": "%9.3e", "Constraint": "%9.3e", "TV": "%9.3e"}
+        itstat_attrib = ["norm_primal_residual()", "norm_dual_residual()", "snr()", "constraint()", "tv()"]
 
         return itstat_fields, itstat_attrib
 
@@ -254,11 +247,38 @@ class DecentralizedADMM:
     def minimizer(self) -> Union[Array, BlockArray]:
         return self.x_list
 
-    def objective(
-        self,
-        x: Optional[Union[Array, BlockArray]] = None,
-        z_list: Optional[List[Union[Array, BlockArray]]] = None,
-    ) -> float:
+    def snr(self) -> float:
+        Nz, Ny, Nx = self.ground_truth.shape
+        tangle_recon = snp.zeros(self.ground_truth.shape)
+
+        for i in range(self.row_division_num):
+            for j in range(self.col_division_num):
+                roi_start_row, roi_end_row = i * Nx // self.row_division_num, (i + 1) * Nx // self.row_division_num  # Selected rows
+                roi_start_col, roi_end_col = j * Ny // self.col_division_num, (j + 1) * Ny // self.col_division_num  # Selected columns
+                tangle_recon = tangle_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(self.x_list[i * self.col_division_num + j])
+
+        return metric.snr(self.ground_truth, tangle_recon)
+
+    def constraint(self) -> float:
+        out = 0.0
+
+        Aix_list = []
+        for i, x_i in enumerate(self.x_list):
+            Aix = self.A_list[i](x_i)
+            Aix = jax.device_put(Aix, self.device)
+            Aix_list.append(Aix)
+
+        out += self.ρ * snp.linalg.norm(sum(Aix_list) - self.y) ** 2 / 2
+
+        return out
+
+    def tv(self) -> float:
+        out = 0.0
+        for i in range(self.N):
+            out += self.g_list[i](self.x_list[i])
+        return out
+
+    def objective(self) -> float:
         r"""Evaluate the objective function.
 
         Evaluate the objective function
@@ -285,20 +305,9 @@ class DecentralizedADMM:
         Returns:
             Value of the objective function.
         """
-        if (x is None) != (z_list is None):
-            raise ValueError("Both or neither of x and z_list must be supplied.")
-        if x is None:
-            x = self.x
-            z_list = self.z_list
-        assert z_list is not None
-        out = 0.0
-        if self.f:
-            out += self.f(x)
-        for g, z in zip(self.g_list, z_list):
-            out += g(z)
-        return out
+        return self.constraint() + self.tv()
 
-    def norm_primal_residual(self, x: Optional[Union[Array, BlockArray]] = None) -> float:
+    def norm_primal_residual(self, x_list: Optional[Union[Array, BlockArray]] = None) -> float:
         r"""Compute the :math:`\ell_2` norm of the primal residual.
 
         Compute the :math:`\ell_2` norm of the primal residual
@@ -315,13 +324,18 @@ class DecentralizedADMM:
         Returns:
             Norm of primal residual.
         """
-        if x is None:
-            x = self.x
+        if x_list is None:
+            x_list = self.x_list
 
-        sum = 0.0
-        for rhoi, Ci, zi in zip(self.rho_list, self.D_list, self.z_list):
-            sum += rhoi * norm(Ci(self.x) - zi) ** 2
-        return snp.sqrt(sum)
+        Aix_list = []
+        for i, x_i in enumerate(x_list):
+            Aix = self.A_list[i](x_i)
+            Aix = jax.device_put(Aix, self.device)
+            Aix_list.append(Aix)
+        
+        residual = self.ρ * snp.linalg.norm(sum(Aix_list) - self.y) ** 2
+        
+        return snp.sqrt(residual)
 
     def norm_dual_residual(self) -> float:
         r"""Compute the :math:`\ell_2` norm of the dual residual.
@@ -336,13 +350,13 @@ class DecentralizedADMM:
             Norm of dual residual.
 
         """
-        sum = 0.0
-        for rhoi, zi, ziold, Ci in zip(self.rho_list, self.z_list, self.z_list_old, self.D_list):
-            sum += rhoi * Ci.adj(zi - ziold)
-        return norm(sum)
+        dual_residual = 0.0
+        for i in range(self.N):
+            dual_residual += self.ρ * self.A_list[i].T(self.λ - self.λ_prev)
+        return snp.linalg.norm(dual_residual)
 
     def step(self):
-        r"""Perform a single ADMM iteration.
+        r"""Perform a single proximal Jacobi ADMM iteration.
 
         The primary variable :math:`\mb{x}` is updated by solving the the
         optimization problem
@@ -370,44 +384,81 @@ class DecentralizedADMM:
             \mb{u}_i^{(k+1)} =  \mb{u}_i^{(k)} + C_i \mb{x}^{(k+1)} -
             \mb{z}^{(k+1)}_i \;.
         """
-        print(f"Iteration {self.itnum} starts.")
+        # Store the previous two iterations' x, dual variable λ, and residual.
+        self.x_list_two_prev = self.x_list_prev.copy()
+        self.x_list_prev = self.x_list.copy()
+
+        self.res_two_prev = self.res_prev.copy()
+        self.res_prev = self.res.copy()
+
+        self.λ_prev = self.λ.copy()
 
         # x-update for all the subproblem blocks. 
-        # Notice that each of the x-update is a ADMM problem itself, but they can be solved in parallel on different GPUs.
-        # for i in range(len(self.ADMM_list)):
+        # Each of the x-update is a proximal operator update.
+        Ax_k = sum(self.A_list[i](self.x_list[i]) for i in range(self.N))
         for i in range(self.N):
-            self.x_list[i] = (self.ADMM_list[i]).solve()
+            grad = self.ρ * self.A_list[i].T(Ax_k - self.y - self.λ / self.ρ)
+            # Proximal operator update of the TV norm.
+            self.x_list[i] = self.g_list[i].prox(self.x_list[i] - 1 / self.τ * grad, self.c / self.τ)
+            self.x_list[i] = snp.array(jax.device_put(self.x_list[i], self.device))
+        
+        # Update the residual.
+        # Notice that this in fact can be done parallelly in practice, on self.N GPUs!
+        self.res = sum(self.A_list[i](self.x_list[i]) for i in range(self.N)) - self.y
+        self.res = jax.device_put(self.res, self.device)
 
-        self.Ax_avg = self.calculate_Ax_avg(self.x_list)
+        # Update dual variable λ
+        # Notice that in practice, only A_ix_i-y needs to be distributed, which has much smaller size than the full image.
+        # This part might be accelerated further.
+        self.λ = self.λ - self.γ * self.ρ * (sum(self.A_list[i](self.x_list[i]) for i in range(self.N)) - self.y)
+        self.λ = jax.device_put(self.λ, self.device)
 
-        # Closed-form solution for z_avg update.
-        self.z_avg = 1 / (self.N + self.rho_list[0]) * (self.y + self.rho_list[0] * self.Ax_avg + self.rho_list[0] * self.u_avg)
-        # Update for the u_avg.
-        self.u_avg = self.u_avg + self.Ax_avg - self.z_avg
+        if self.with_correction:
+            # Compute the correction step.
+            for i in range(self.N):
+                self.x_list[i] = self.x_list_prev[i] - self.α * (self.x_list_prev[i] - self.x_list[i])
+            self.λ = self.λ_prev - self.α * (self.λ_prev - self.λ)
 
-        # Update the ADMM solvers for each block.
-        for i in range(len(self.ADMM_list)):
-            y_i = self.A_list[i](self.x_list[i].copy()) + self.z_avg - self.Ax_avg - self.u_avg
-            new_solver = ADMM(
-                f = loss.SquaredL2Loss(y=y_i, A=self.A_list[i]),
-                g_list = [self.g_list[0]],
-                C_list = [self.D_list[i]],
-                rho_list = [self.rho_list[0]],
-                alpha = self.alpha,
-                x0 = self.x_list[i].copy(),
-                maxiter = self.maxiter_per_block,
-                subproblem_solver = LinearSubproblemSolver(cg_kwargs={"tol": self.cg_tol, "maxiter": self.cg_maxiter}),
-                itstat_options={"display": True, "period": self.display_period}
-            )
-            self.ADMM_list[i] = new_solver
 
-        return self.x_list.copy()
+        # Compute 2/gamma*(lambda^k-lambda^{k+1})'*A(x^k-x^{k+1})
+        cross_term = 2 * self.ρ * snp.dot(self.res.reshape(-1), (self.res_prev - self.res).reshape(-1))
+        # Compute ||x^k-x^{k+1}||^2_G
+        dx_norm = 0
+        for i in range(self.N):
+            diff = (self.x_list[i] - self.x_list_prev[i]).reshape(-1)
+            dx_norm += snp.linalg.norm(diff)**2 * self.τ
+        # Compute (2-gamma)/(rho*gamma^2)*||lambda^k-lambda^{k+1}||^2
+        d_lambda_norm = (2 - self.γ) * self.ρ * snp.linalg.norm(self.res)**2
+        # Compute the lower bound of error decrease: h(u^k,u^{k+1})
+        lower_bound = dx_norm + d_lambda_norm + cross_term
+
+        if lower_bound < 0:
+            print("τ is doubled at iteration ", self.itnum)
+            self.τ = self.τ * 2
+
+            # Revert back the variables.
+            self.x_list = self.x_list_prev
+            self.λ = self.λ + self.γ * self.ρ * (sum(self.A_list[i](self.x_list[i]) for i in range(self.N)) - self.y)
+            self.λ = jax.device_put(self.λ, self.device)
+            # Revert back the stored variables.
+            self.x_list = self.x_list_prev.copy()
+            self.res = self.res_prev.copy()
+            self.x_list_prev = self.x_list_two_prev.copy()
+            self.res_prev = self.res_two_prev.copy()
+        elif self.itnum % 10 == 0:
+            # Decrase τ after every a pre-defined number of iterations.
+            self.τ = self.τ / 1.2
+
+        self.x_all.append(self.x_list.copy())
+        self.res_all.append(norm(self.res.reshape(-1), ord=2))
+            
+
+
 
         
 
     def solve(
         self,
-        return_intermediate_results: bool = False,
         callback: Optional[Callable[[Optimizer], None]] = None,
     ) -> Union[Array, BlockArray]:
         r"""Initialize and run the optimization algorithm.
@@ -424,29 +475,20 @@ class DecentralizedADMM:
             Computed solution.
         """
         self.timer.start()
-        if return_intermediate_results:
-            self.intermediate_results = []
         for self.itnum in range(self.itnum, self.itnum + self.maxiter):
-            self.intermediate_results.append(self.step())
+            self.step()
             if self.nanstop and not self._working_vars_finite():
                 raise ValueError(
                     f"NaN or Inf value encountered in working variable in iteration {self.itnum}."
                     ""
                 )
-            # self.itstat_object.insert(self.itstat_insert_func(self))
+            self.itstat_object.insert(self.itstat_insert_func(self))
             if callback:
                 self.timer.stop()
                 callback(self)
                 self.timer.start()
+
         self.timer.stop()
-        self.itnum += 1
-        # self.itstat_object.end()
-        if return_intermediate_results:
-            return self.intermediate_results
+        self.itstat_object.end()
         
-        return self.minimizer()
-
-    def calculate_Ax_avg(self, x_list: List[Union[Array, BlockArray]]):
-        Ax_list = [self.A_list[i](x_list[i]) for i in range(len(self.A_list))]
-        return sum(Ax_list) / len(Ax_list)
-
+        return self.minimizer(), self.x_all, self.res_all

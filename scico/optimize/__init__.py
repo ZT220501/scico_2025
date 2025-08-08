@@ -17,6 +17,8 @@ from .pgm import PGM, AcceleratedPGM
 from ._primaldual import PDHG
 from ._padmm import ProximalADMM, NonLinearPADMM, ProximalADMMBase
 from ._dadmm import DecentralizedADMM
+from ._pjadmm import ProxJacobiADMM
+from ._pjadmm_overlapped import ProxJacobiOverlappedADMM
 
 __all__ = [
     "ADMM",
@@ -29,6 +31,8 @@ __all__ = [
     "PDHG",
     "Optimizer",
     "DecentralizedADMM",
+    "ProxJacobiADMM",
+    "ProxJacobiOverlappedADMM",
 ]
 
 # Imported items in __all__ appear to originate in top-level linop module

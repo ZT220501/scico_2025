@@ -93,24 +93,25 @@ class XRayTransformParallel(LinearOperator):
         else:
             self.indices = mbirjax.gen_full_indices(self.model.get_params("recon_shape"), use_ror_mask=False)
 
-        # Set up custom_vjp for _eval and _adj so jax.grad works on them.
-        self._eval = jax.custom_vjp(self._proj_hcb)
-        self._eval.defvjp(lambda x: (self._proj_hcb(x), None), lambda _, y: (self._bproj_hcb(y),))  # type: ignore
-
-        self._adj = jax.custom_vjp(self._bproj_hcb)
-        self._adj.defvjp(lambda y: (self._bproj_hcb(y), None), lambda _, x: (self._proj_hcb(x),))  # type: ignore
-
         super().__init__(
             input_shape=input_shape,
             output_shape=output_shape,
             input_dtype=np.float32,
             output_dtype=np.float32,
-            eval_fn=self._eval,
-            adj_fn=self._adj,
+            # eval_fn=self._eval,
+            # adj_fn=self._adj,
+            eval_fn=self.project,
+            adj_fn=self.back_project,
             jit=jit,
         )
 
         self.projector_params = self.create_projector_params()
+
+    def project(self, x: snp.Array) -> snp.Array:
+        return self._proj(x, self.indices, self.model.get_params("angles"), self.projector_params)
+    
+    def back_project(self, y: snp.Array) -> snp.Array:
+        return self._bproj(y, self.indices, self.model.get_params("angles"), self.projector_params, coeff_power=1)
 
     @staticmethod
     def _proj(
@@ -119,6 +120,8 @@ class XRayTransformParallel(LinearOperator):
         angles: snp.Array,
         projector_params: dict,
     ) -> snp.Array:
+        
+        x = x.transpose(2, 1, 0)
         # Turn the 3D image into voxel values.
         voxel_values = x.copy()
         voxel_values = voxel_values.reshape(-1, x.shape[-1])
@@ -139,24 +142,26 @@ class XRayTransformParallel(LinearOperator):
         sinogram = sinogram.transpose(1, 0, 2)
         return snp.array(sinogram)
 
-    def _proj_hcb(self, x: snp.Array) -> snp.Array:
-        """
-        Host callback wrapper for forward projection.
-        """
-        # Transpose the input to match the mbirjax convention.
-        x = x.transpose(2, 1, 0)
-        y = jax.pure_callback(
-            lambda x: self._proj(
-                np.array(x),
-                self.indices,
-                self.model.get_params("angles"),
-                self.projector_params,
-            ),
-            jax.ShapeDtypeStruct(self.output_shape, self.output_dtype),
-            x,
-        )
+    # def _proj_hcb(self, x: snp.Array) -> snp.Array:
+    #     """
+    #     Host callback wrapper for forward projection.
+    #     """
+    #     # Transpose the input to match the mbirjax convention.
+    #     x = x.transpose(2, 1, 0)
+    #     # This put the stuff out of the GPU and to the CPU.
+    #     # TODO: Fix this; maybe not use pure_callback?
+    #     y = jax.pure_callback(
+    #         lambda x: self._proj(
+    #             np.array(x),
+    #             self.indices,
+    #             self.model.get_params("angles"),
+    #             self.projector_params,
+    #         ),
+    #         jax.ShapeDtypeStruct(self.output_shape, self.output_dtype),
+    #         x,
+    #     )
 
-        return y
+    #     return y
 
     @staticmethod
     def _bproj(
@@ -201,22 +206,22 @@ class XRayTransformParallel(LinearOperator):
         recon = recon.transpose(2, 1, 0)
         return snp.array(recon)
     
-    def _bproj_hcb(self, y: snp.Array) -> snp.Array:
-        """
-        Host callback wrapper for backward projection.
-        """
-        x = jax.pure_callback(
-            lambda y: self._bproj(
-                np.array(y),
-                self.indices,
-                self.model.get_params("angles"),
-                self.projector_params,
-                coeff_power=1,
-            ),
-            jax.ShapeDtypeStruct(self.input_shape, self.input_dtype),
-            y,
-        )
-        return x
+    # def _bproj_hcb(self, y: snp.Array) -> snp.Array:
+    #     """
+    #     Host callback wrapper for backward projection.
+    #     """
+    #     x = jax.pure_callback(
+    #         lambda y: self._bproj(
+    #             np.array(y),
+    #             self.indices,
+    #             self.model.get_params("angles"),
+    #             self.projector_params,
+    #             coeff_power=1,
+    #         ),
+    #         jax.ShapeDtypeStruct(self.input_shape, self.input_dtype),
+    #         y,
+    #     )
+    #     return x
     
     def get_params(self, parameter_names=None) -> Any:
         if parameter_names is None:
