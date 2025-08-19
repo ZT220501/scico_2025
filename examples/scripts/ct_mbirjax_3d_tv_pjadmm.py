@@ -97,8 +97,7 @@ def pjadmm_test(Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2, d
                 recon_shape=(Nx, Ny, Nz)
             )
 
-            # g = IsotropicTVNorm(input_shape=A.input_shape, input_dtype=A.input_dtype)
-            g = L1Norm()
+            g = IsotropicTVNorm(input_shape=A.input_shape, input_dtype=A.input_dtype)
 
             # Append the mbirjax projector and sinogram to the list
             A_list.append(A)
@@ -111,27 +110,22 @@ def pjadmm_test(Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2, d
 
     if do_block_recon:
         """
-        Set up problems and solvers for tv regularized solver.
+        Set up problems and solvers.
         """
-        ρ = 1e-4
-        τ = 0.03
-        tv_weight = 1
-
+        ρ = 1e-3
+        τ = 0.1
+        tv_weight = 8e-3
         γ = 1  # Damping parameter
         λ = snp.zeros(A_list[0].output_shape, dtype=A_list[0].output_dtype)  # Dual variable
         correction = False
         α = 0.8 if correction else None
-        maxiter = 100  # number of decentralized ADMM iterations
+        maxiter = 1000  # number of decentralized ADMM iterations
 
-        print(f"ρ: {ρ}, τ: {τ}, regularization: {tv_weight}, γ: {γ}, correction: {correction}, α: {α}, maxiter: {maxiter}")
+        print(f"ρ: {ρ}, τ: {τ}, γ: {γ}, correction: {correction}, α: {α}, maxiter: {maxiter}")
 
         test_mode = True
 
-        # Set up the tv regularizer for each ROI as the new g_list.
-        g_list = [IsotropicTVNorm(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]
-
-        # Use the result of l1 regularized solver as the initial guess for tv regularized solver.
-        tv_solver = ProxJacobiADMM(
+        solver = ProxJacobiADMM(
             A_list=A_list,
             g_list=g_list,
             ρ=ρ,
@@ -154,69 +148,12 @@ def pjadmm_test(Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2, d
         )
 
         """
-        Run the tv regularized solver.
+        Run the solver.
         """
         print(f"Solving on {device_info()}\n")
-        tangle_recon_list, x_all, res_all = tv_solver.solve()
+        tangle_recon_list, x_all, res_all = solver.solve()
 
-
-
-        """
-        Set up problems and solvers for l1 regularized solver.
-        """
-        #####################################################
-        # # This is the best setting for the current problem.
-        # ρ = 1e-3
-        # τ = 0.1
-        # tv_weight = 9e-3
-
-        # In pjadmm, the τ is divided by 1.2 for every 10 iterations.
-        #####################################################
-
-        # This is the best setting for the current problem.
-        ρ = 1e-3
-        τ = 0.1
-        tv_weight = 8e-3
-
-        γ = 1  # Damping parameter
-        λ = snp.zeros(A_list[0].output_shape, dtype=A_list[0].output_dtype)  # Dual variable
-        correction = False
-        α = 0.8 if correction else None
-        maxiter = 900  # number of decentralized ADMM iterations
-
-        print(f"ρ: {ρ}, τ: {τ}, regularization: {tv_weight}, γ: {γ}, correction: {correction}, α: {α}, maxiter: {maxiter}")
-
-        test_mode = True
-
-        l1_solver = ProxJacobiADMM(
-            A_list=A_list,
-            g_list=g_list,
-            ρ=ρ,
-            y=y,
-            τ=τ,
-            γ=γ,
-            λ=λ,
-            x0_list=tangle_recon_list,
-            display_period = 1,
-            device = gpu_devices[0],
-            with_correction = correction,
-            α = α,
-            maxiter = maxiter,
-            itstat_options={"display": True, "period": 10},
-            ground_truth = tangle,
-            test_mode = test_mode,
-            row_division_num = row_division_num,
-            col_division_num = col_division_num,
-            tv_weight = tv_weight
-        )
-
-        """
-        Run the l1 regularized solver.
-        """
-        print(f"Solving on {device_info()}\n")
-        tangle_recon_list, x_all, res_all = l1_solver.solve()
-
-        save_path = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_l1_{row_division_num}_{col_division_num}')
+        save_path = os.path.join(os.path.dirname(__file__), f'results/pjadmm_{row_division_num}_{col_division_num}')
         os.makedirs(save_path, exist_ok=True)
         snp.save(os.path.join(save_path, 'x_all.npy'), x_all)
         snp.save(os.path.join(save_path, 'res_all.npy'), res_all)
@@ -226,10 +163,23 @@ def pjadmm_test(Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2, d
         plt.legend()
         plt.show()
         plt.savefig(os.path.join(save_path, 'res_all.pdf'))
-
+    else:
+        print("Loading the results from the file...")
+        tangle_recon = np.load(os.path.join(os.path.dirname(__file__), f'results/pjadmm_{row_division_num}_{col_division_num}/x_all.npy'))
+        print(tangle_recon.shape)
+        tangle_recon = tangle_recon[100]
         
+        tangle_recon_list = [tangle_recon[i] for i in range(row_division_num * col_division_num)]
 
+        tangle_recon = np.zeros((Nz, Ny, Nx))
 
+        for i in range(row_division_num):
+            for j in range(col_division_num):
+                roi_start_row, roi_end_row = i * Nx // row_division_num, (i + 1) * Nx // row_division_num  # Selected rows
+                roi_start_col, roi_end_col = j * Ny // col_division_num, (j + 1) * Ny // col_division_num  # Selected columns
+                tangle_recon[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row] = tangle_recon_list[i * col_division_num + j]
+
+        print("residual: ", snp.linalg.norm((A_full @ tangle_recon - y).reshape(-1), ord=2))
     
 
     '''
@@ -272,9 +222,9 @@ def pjadmm_test(Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2, d
     fig.colorbar(ax[1].get_images()[0], cax=cax, label="arbitrary units")
     fig.show()
 
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_l1_{row_division_num}_{col_division_num}')
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_{row_division_num}_{col_division_num}')
     os.makedirs(results_dir, exist_ok=True)
-    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_tv_l1_recon_{n_projection}views.png')
+    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_recon_{n_projection}views.png')
     fig.savefig(save_path)   # save the figure to file
 
     return tangle_recon

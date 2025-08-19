@@ -44,7 +44,7 @@ Nz = 64
 
 tangle = snp.array(create_tangle_phantom(Nx, Ny, Nz))
 
-n_projection = 10  # number of projections
+n_projection = 30  # number of projections
 angles = np.linspace(0, np.pi, n_projection, endpoint=False)  # evenly spaced projection angles
 C = XRayTransform3D(
     tangle.shape, det_count=[Nz, max(Nx, Ny)], det_spacing=[1.0, 1.0], angles=angles
@@ -59,7 +59,7 @@ Set up problem and solver.
 """
 λ = 2e0  # ℓ2,1 norm regularization parameter
 ρ = 5e0  # ADMM penalty parameter
-maxiter = 25  # number of ADMM iterations
+maxiter = 100  # number of ADMM iterations
 cg_tol = 1e-4  # CG relative tolerance
 cg_maxiter = 25  # maximum CG iterations per ADMM iteration
 

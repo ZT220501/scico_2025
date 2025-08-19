@@ -22,6 +22,7 @@ from scico.optimize.admm import ADMM
 from scico import functional, linop, loss, metric, plot
 from scico.util import Timer
 import jax
+import numpy as np
 
 from ._admmaux import (
     FBlockCircularConvolveSolver,
@@ -35,9 +36,11 @@ from ._common import Optimizer
 
 
 
-class ProxJacobiADMM(Optimizer):
+class ProxJacobiBregmanADMM(Optimizer):
     r"""Proximal Jacobi Alternating Direction Method of Multipliers (ADMM) algorithm.
     For reference, see https://link.springer.com/article/10.1007/s10915-016-0318-2.
+    
+    Splitting Bregman method is used to 
 
     |
 
@@ -106,6 +109,15 @@ class ProxJacobiADMM(Optimizer):
         y: Array,
         τ: float,
         γ: float,
+        row_start_indices: List[int],
+        col_start_indices: List[int],
+        row_end_indices: List[int],
+        col_end_indices: List[int],
+        row_start_indices_original: List[int],
+        col_start_indices_original: List[int],
+        row_end_indices_original: List[int],
+        col_end_indices_original: List[int],
+        overlap_size: int,
         tv_weight: float,
         λ: Optional[Array] = None,
         x0_list: Optional[List[Union[Array, BlockArray]]] = None,
@@ -117,8 +129,6 @@ class ProxJacobiADMM(Optimizer):
         α: float = None,
         test_mode: bool = False,
         ground_truth: Optional[Array] = None,
-        row_division_num: int = 4,
-        col_division_num: int = 8,
         **kwargs,
     ):
         r"""Initialize an :class:`ADMM` object.
@@ -167,8 +177,8 @@ class ProxJacobiADMM(Optimizer):
         self.ρ: float = ρ                               # ADMM penalty parameter.
         self.y: Array = y                                # Ground truth full sinogram.
         self.γ: float = γ                                # Damping parameter.
-        self.τ: float = τ                                # Proximal weight.
-        self.tv_weight: float = tv_weight                # TV weight.
+        self.τ: float = τ                                # Prox parameter.
+        self.tv_weight: float = tv_weight                # TV regularization weight.
         self.display_period: int = display_period        # Display period for the ADMM solver.
         self.with_correction: bool = with_correction    # Whether to use the correction term.
 
@@ -200,8 +210,17 @@ class ProxJacobiADMM(Optimizer):
         self.res_all = [norm(self.res.reshape(-1), ord=2)]
         self.x_all = [self.x_list.copy()]
 
-        self.row_division_num: int = row_division_num
-        self.col_division_num: int = col_division_num
+        self.row_start_indices: List[int] = row_start_indices
+        self.col_start_indices: List[int] = col_start_indices
+        self.row_end_indices: List[int] = row_end_indices
+        self.col_end_indices: List[int] = col_end_indices
+
+        self.row_start_indices_original: List[int] = row_start_indices_original
+        self.col_start_indices_original: List[int] = col_start_indices_original
+        self.row_end_indices_original: List[int] = row_end_indices_original
+        self.col_end_indices_original: List[int] = col_end_indices_original
+
+        self.overlap_size: int = overlap_size
 
         super().__init__(**kwargs)
 
@@ -231,7 +250,7 @@ class ProxJacobiADMM(Optimizer):
 
     def _itstat_extra_fields(self):
         """Define ADMM-specific iteration statistics fields."""
-        itstat_fields = {"Prml Rsdl": "%9.3e", "Dual Rsdl": "%9.3e", "SNR": "%9.3e", "Constraint": "%9.3e", "Regularization": "%9.3e"}
+        itstat_fields = {"Prml Rsdl": "%9.3e", "Dual Rsdl": "%9.3e", "SNR": "%9.3e", "Constraint": "%9.3e", "TV": "%9.3e"}
         itstat_attrib = ["norm_primal_residual()", "norm_dual_residual()", "snr()", "constraint()", "tv()"]
 
         return itstat_fields, itstat_attrib
@@ -245,18 +264,47 @@ class ProxJacobiADMM(Optimizer):
 
     def minimizer(self) -> Union[Array, BlockArray]:
         return self.x_list
-
-    def snr(self) -> float:
-        Nz, Ny, Nx = self.ground_truth.shape
+    
+    def recon_from_blocks(self) -> Array:
         tangle_recon = snp.zeros(self.ground_truth.shape)
 
-        for i in range(self.row_division_num):
-            for j in range(self.col_division_num):
-                roi_start_row, roi_end_row = i * Nx // self.row_division_num, (i + 1) * Nx // self.row_division_num  # Selected rows
-                roi_start_col, roi_end_col = j * Ny // self.col_division_num, (j + 1) * Ny // self.col_division_num  # Selected columns
-                tangle_recon = tangle_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(self.x_list[i * self.col_division_num + j])
+        idx = 0
+        for i in range(len(self.row_start_indices)):
+            starting_row_ind = self.overlap_size if self.row_start_indices_original[i] != self.row_start_indices[i] else 0
+            starting_col_ind = self.overlap_size if self.col_start_indices_original[i] != self.col_start_indices[i] else 0
+            ending_row_ind = -self.overlap_size if self.row_end_indices_original[i] != self.row_end_indices[i] else self.ground_truth.shape[2]
+            ending_col_ind = -self.overlap_size if self.col_end_indices_original[i] != self.col_end_indices[i] else self.ground_truth.shape[1]
 
-        return metric.snr(self.ground_truth, tangle_recon)
+            tangle_recon = tangle_recon.at[:, self.col_start_indices_original[i]:self.col_end_indices_original[i], self.row_start_indices_original[i]:self.row_end_indices_original[i]].set(self.x_list[idx][:, starting_col_ind:ending_col_ind, starting_row_ind:ending_row_ind])
+            idx += 1
+
+        return tangle_recon
+
+        # overlap_indicator = np.zeros(self.ground_truth.shape)
+
+        # idx = 0
+        # for i in range(len(self.row_start_indices)):
+        #     tangle_recon_list[idx] = tangle_recon_list[idx].at[:, self.col_start_indices[i]:self.col_end_indices[i], self.row_start_indices[i]:self.row_end_indices[i]].set(self.x_list[idx])
+        #     overlap_indicator[:, self.col_start_indices[i]:self.col_end_indices[i], self.row_start_indices[i]:self.row_end_indices[i]] += 1
+        #     idx += 1
+
+        # # Average the overlapping parts.
+        # try:
+        #     overlap_indicator = 1 / overlap_indicator
+        # except:
+        #     raise ValueError("Overlap indicator is not valid; some of the indices are not coverd by the blocks.")
+        
+        # return sum(tangle_recon_list) * overlap_indicator
+
+    def divide_blocks(self, recon_full: Array) -> List[Array]:
+        x_list = []
+        for i in range(len(self.row_start_indices)):
+            x_list.append(recon_full[:, self.col_start_indices[i]:self.col_end_indices[i], self.row_start_indices[i]:self.row_end_indices[i]])
+
+        return x_list
+
+    def snr(self) -> float:
+        return metric.snr(self.ground_truth, self.recon_from_blocks())
 
     def constraint(self) -> float:
         out = 0.0
@@ -432,7 +480,7 @@ class ProxJacobiADMM(Optimizer):
         lower_bound = dx_norm + d_lambda_norm + cross_term
 
         if lower_bound < 0:
-            print("τ is doubled at iteration ", self.itnum)
+            # Less aggressive τ doubling - only increase by 1.5x instead of 2x
             self.τ = self.τ * 2
 
             # Revert back the variables.
@@ -444,10 +492,16 @@ class ProxJacobiADMM(Optimizer):
             self.res = self.res_prev.copy()
             self.x_list_prev = self.x_list_two_prev.copy()
             self.res_prev = self.res_two_prev.copy()
-        elif self.itnum % 10 == 0:
+        elif self.itnum % 50 == 0:
             # Decrase τ after every a pre-defined number of iterations.
-            self.τ = self.τ / 1.2
-            # self.τ = self.τ / 2
+            self.τ = self.τ / 1.5
+
+        # # Synchronize the x_list after every 100 iters.
+        # # For the overlapping parts, average values are taken.
+        # if self.itnum % 100 == 0:
+        #     print("Average the overlapping parts....")
+        #     recon_full = self.recon_from_blocks()
+        #     self.x_list = self.divide_blocks(recon_full)
 
         self.x_all.append(self.x_list.copy())
         self.res_all.append(norm(self.res.reshape(-1), ord=2))
