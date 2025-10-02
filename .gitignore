@@ -139,3 +139,7 @@ dmypy.json
 
 # macos files
 *.DS_Store
+
+# Results
+examples/scripts/results/
+*.png

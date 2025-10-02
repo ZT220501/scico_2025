@@ -12,6 +12,9 @@
 from __future__ import annotations
 
 from typing import List, Optional, Tuple, Union, Callable
+import logging
+import os
+from datetime import datetime
 
 import scico.numpy as snp
 from scico.functional import Functional
@@ -197,8 +200,8 @@ class ProxJacobiADMM(Optimizer):
         self.res_two_prev = self.res.copy()
         self.res_prev = self.res.copy()
 
-        self.res_all = [norm(self.res.reshape(-1), ord=2)]
-        self.x_all = [self.x_list.copy()]
+        # self.res_all = [norm(self.res.reshape(-1), ord=2)]
+        # self.x_all = [self.x_list.copy()]
 
         self.row_division_num: int = row_division_num
         self.col_division_num: int = col_division_num
@@ -431,6 +434,8 @@ class ProxJacobiADMM(Optimizer):
         # Compute the lower bound of error decrease: h(u^k,u^{k+1})
         lower_bound = dx_norm + d_lambda_norm + cross_term
 
+
+        # For tau, set it to 1.05 operator norm might be able to work.
         if lower_bound < 0:
             print("τ is doubled at iteration ", self.itnum)
             self.τ = self.τ * 2
@@ -444,13 +449,12 @@ class ProxJacobiADMM(Optimizer):
             self.res = self.res_prev.copy()
             self.x_list_prev = self.x_list_two_prev.copy()
             self.res_prev = self.res_two_prev.copy()
-        elif self.itnum % 10 == 0:
+        elif self.itnum % 50 == 0:
             # Decrase τ after every a pre-defined number of iterations.
-            self.τ = self.τ / 1.2
-            # self.τ = self.τ / 2
+            self.τ = self.τ / 1.5
 
-        self.x_all.append(self.x_list.copy())
-        self.res_all.append(norm(self.res.reshape(-1), ord=2))
+        # self.x_all.append(self.x_list.copy())
+        # self.res_all.append(norm(self.res.reshape(-1), ord=2))
             
 
 
@@ -491,4 +495,5 @@ class ProxJacobiADMM(Optimizer):
         self.timer.stop()
         self.itstat_object.end()
         
-        return self.minimizer(), self.x_all, self.res_all
+        # return self.minimizer(), self.x_all, self.res_all
+        return self.minimizer()

@@ -97,8 +97,8 @@ gradient sub-iterations used by the ADMM solver in the
 𝛼 = 1e2  # improve problem conditioning by balancing C and D components of A
 λ = 2e0 / 𝛼  # ℓ2,1 norm regularization parameter
 ρ = 5e-3  # ADMM penalty parameter
-# maxiter = 1000  # number of ADMM iterations
-maxiter = 1
+maxiter = 1000  # number of ADMM iterations
+# maxiter = 1
 
 f = functional.ZeroFunctional()
 g0 = loss.SquaredL2Loss(y=y)
@@ -110,6 +110,7 @@ A = linop.VerticalStack((C, 𝛼 * D))
 
 
 mu, nu = ProximalADMM.estimate_parameters(A)
+print(f"mu: {mu}, nu: {nu}")
 
 solver = ProximalADMM(
     f=f,

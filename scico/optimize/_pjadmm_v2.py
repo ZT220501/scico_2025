@@ -12,17 +12,23 @@
 from __future__ import annotations
 
 from typing import List, Optional, Tuple, Union, Callable
+from scico.typing import BlockShape, DType, PRNGKey, Shape
+import logging
+import os
+import sys
+from datetime import datetime
+from io import StringIO
 
 import scico.numpy as snp
 from scico.functional import Functional
 from scico.linop import LinearOperator
 from scico.numpy import Array, BlockArray
 from scico.numpy.linalg import norm
+from scico.linop import Identity, LinearOperator, operator_norm
 from scico.optimize.admm import ADMM
 from scico import functional, linop, loss, metric, plot
 from scico.util import Timer
 import jax
-import numpy as np
 
 from ._admmaux import (
     FBlockCircularConvolveSolver,
@@ -36,11 +42,11 @@ from ._common import Optimizer
 
 
 
-class ProxJacobiBregmanADMM(Optimizer):
-    r"""Proximal Jacobi Alternating Direction Method of Multipliers (ADMM) algorithm.
+class ProxJacobiADMMv2(Optimizer):
+    r"""Proximal Jacobi Alternating Direction Method of Multipliers (ADMM) algorithm, version 2.
     For reference, see https://link.springer.com/article/10.1007/s10915-016-0318-2.
-    
-    Splitting Bregman method is used to 
+    In this version, the parameter τ is not updated as in the original proximal Jacobi ADMM, but instead  
+    approximated using the matrix norm of the block-wise operator A
 
     |
 
@@ -107,17 +113,8 @@ class ProxJacobiBregmanADMM(Optimizer):
         g_list: List[Functional],
         ρ: float,
         y: Array,
-        τ: float,
+        τ: List[float],
         γ: float,
-        row_start_indices: List[int],
-        col_start_indices: List[int],
-        row_end_indices: List[int],
-        col_end_indices: List[int],
-        row_start_indices_original: List[int],
-        col_start_indices_original: List[int],
-        row_end_indices_original: List[int],
-        col_end_indices_original: List[int],
-        overlap_size: int,
         tv_weight: float,
         λ: Optional[Array] = None,
         x0_list: Optional[List[Union[Array, BlockArray]]] = None,
@@ -129,6 +126,8 @@ class ProxJacobiBregmanADMM(Optimizer):
         α: float = None,
         test_mode: bool = False,
         ground_truth: Optional[Array] = None,
+        row_division_num: int = 4,
+        col_division_num: int = 8,
         **kwargs,
     ):
         r"""Initialize an :class:`ADMM` object.
@@ -174,13 +173,14 @@ class ProxJacobiBregmanADMM(Optimizer):
         self.A_list: List[LinearOperator] = A_list      # List of partial forward sinogram projection operators typically.
         self.g_list: List[Functional] = g_list          # List of TV regularizers typically.
 
-        self.ρ: float = ρ                               # ADMM penalty parameter.
+        self.ρ: float = ρ                                # ADMM penalty parameter.
         self.y: Array = y                                # Ground truth full sinogram.
         self.γ: float = γ                                # Damping parameter.
-        self.τ: float = τ                                # Prox parameter.
-        self.tv_weight: float = tv_weight                # TV regularization weight.
+        self.τ: List[float] = τ                          # Proximal weight for each block, estimated by the operator norm.
+                                                         # Notice that τ is a list of length N, where N is the number of blocks.
+        self.tv_weight: float = tv_weight                # TV weight.
         self.display_period: int = display_period        # Display period for the ADMM solver.
-        self.with_correction: bool = with_correction    # Whether to use the correction term.
+        self.with_correction: bool = with_correction     # Whether to use the correction term.
 
         if λ is None:
             self.λ = snp.zeros(A_list[0].output_shape, dtype=A_list[0].output_dtype)
@@ -207,20 +207,11 @@ class ProxJacobiBregmanADMM(Optimizer):
         self.res_two_prev = self.res.copy()
         self.res_prev = self.res.copy()
 
-        self.res_all = [norm(self.res.reshape(-1), ord=2)]
-        self.x_all = [self.x_list.copy()]
+        # self.res_all = [norm(self.res.reshape(-1), ord=2)]
+        # self.x_all = [self.x_list.copy()]
 
-        self.row_start_indices: List[int] = row_start_indices
-        self.col_start_indices: List[int] = col_start_indices
-        self.row_end_indices: List[int] = row_end_indices
-        self.col_end_indices: List[int] = col_end_indices
-
-        self.row_start_indices_original: List[int] = row_start_indices_original
-        self.col_start_indices_original: List[int] = col_start_indices_original
-        self.row_end_indices_original: List[int] = row_end_indices_original
-        self.col_end_indices_original: List[int] = col_end_indices_original
-
-        self.overlap_size: int = overlap_size
+        self.row_division_num: int = row_division_num
+        self.col_division_num: int = col_division_num
 
         super().__init__(**kwargs)
 
@@ -250,7 +241,7 @@ class ProxJacobiBregmanADMM(Optimizer):
 
     def _itstat_extra_fields(self):
         """Define ADMM-specific iteration statistics fields."""
-        itstat_fields = {"Prml Rsdl": "%9.3e", "Dual Rsdl": "%9.3e", "SNR": "%9.3e", "Constraint": "%9.3e", "TV": "%9.3e"}
+        itstat_fields = {"Prml Rsdl": "%9.3e", "Dual Rsdl": "%9.3e", "SNR": "%9.3e", "Constraint": "%9.3e", "Regularization": "%9.3e"}
         itstat_attrib = ["norm_primal_residual()", "norm_dual_residual()", "snr()", "constraint()", "tv()"]
 
         return itstat_fields, itstat_attrib
@@ -264,47 +255,18 @@ class ProxJacobiBregmanADMM(Optimizer):
 
     def minimizer(self) -> Union[Array, BlockArray]:
         return self.x_list
-    
-    def recon_from_blocks(self) -> Array:
-        tangle_recon = snp.zeros(self.ground_truth.shape)
-
-        idx = 0
-        for i in range(len(self.row_start_indices)):
-            starting_row_ind = self.overlap_size if self.row_start_indices_original[i] != self.row_start_indices[i] else 0
-            starting_col_ind = self.overlap_size if self.col_start_indices_original[i] != self.col_start_indices[i] else 0
-            ending_row_ind = -self.overlap_size if self.row_end_indices_original[i] != self.row_end_indices[i] else self.ground_truth.shape[2]
-            ending_col_ind = -self.overlap_size if self.col_end_indices_original[i] != self.col_end_indices[i] else self.ground_truth.shape[1]
-
-            tangle_recon = tangle_recon.at[:, self.col_start_indices_original[i]:self.col_end_indices_original[i], self.row_start_indices_original[i]:self.row_end_indices_original[i]].set(self.x_list[idx][:, starting_col_ind:ending_col_ind, starting_row_ind:ending_row_ind])
-            idx += 1
-
-        return tangle_recon
-
-        # overlap_indicator = np.zeros(self.ground_truth.shape)
-
-        # idx = 0
-        # for i in range(len(self.row_start_indices)):
-        #     tangle_recon_list[idx] = tangle_recon_list[idx].at[:, self.col_start_indices[i]:self.col_end_indices[i], self.row_start_indices[i]:self.row_end_indices[i]].set(self.x_list[idx])
-        #     overlap_indicator[:, self.col_start_indices[i]:self.col_end_indices[i], self.row_start_indices[i]:self.row_end_indices[i]] += 1
-        #     idx += 1
-
-        # # Average the overlapping parts.
-        # try:
-        #     overlap_indicator = 1 / overlap_indicator
-        # except:
-        #     raise ValueError("Overlap indicator is not valid; some of the indices are not coverd by the blocks.")
-        
-        # return sum(tangle_recon_list) * overlap_indicator
-
-    def divide_blocks(self, recon_full: Array) -> List[Array]:
-        x_list = []
-        for i in range(len(self.row_start_indices)):
-            x_list.append(recon_full[:, self.col_start_indices[i]:self.col_end_indices[i], self.row_start_indices[i]:self.row_end_indices[i]])
-
-        return x_list
 
     def snr(self) -> float:
-        return metric.snr(self.ground_truth, self.recon_from_blocks())
+        Nz, Ny, Nx = self.ground_truth.shape
+        tangle_recon = snp.zeros(self.ground_truth.shape)
+
+        for i in range(self.row_division_num):
+            for j in range(self.col_division_num):
+                roi_start_row, roi_end_row = i * Nx // self.row_division_num, (i + 1) * Nx // self.row_division_num  # Selected rows
+                roi_start_col, roi_end_col = j * Ny // self.col_division_num, (j + 1) * Ny // self.col_division_num  # Selected columns
+                tangle_recon = tangle_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(self.x_list[i * self.col_division_num + j])
+
+        return metric.snr(self.ground_truth, tangle_recon)
 
     def constraint(self) -> float:
         out = 0.0
@@ -446,7 +408,8 @@ class ProxJacobiBregmanADMM(Optimizer):
         for i in range(self.N):
             grad = self.ρ * self.A_list[i].T(Ax_k - self.y - self.λ / self.ρ)
             # Proximal operator update of the TV norm.
-            self.x_list[i] = self.g_list[i].prox(self.x_list[i] - 1 / self.τ * grad, self.tv_weight / self.τ)
+            # Notice that the τ[i] is the proximal weight for the i-th block, instead of using a uniform τ.
+            self.x_list[i] = self.g_list[i].prox(self.x_list[i] - 1 / self.τ[i] * grad, self.tv_weight / self.τ[i])
             self.x_list[i] = snp.array(jax.device_put(self.x_list[i], self.device))
         
         # Update the residual.
@@ -467,21 +430,29 @@ class ProxJacobiBregmanADMM(Optimizer):
             self.λ = self.λ_prev - self.α * (self.λ_prev - self.λ)
 
 
+        #################################################################################################
+        # The code below, which was used in the first version, is deprecated.
+        # tau is now estimated by the operator norm once initially, instead of dynamically updated.
+        #################################################################################################
+
         # Compute 2/gamma*(lambda^k-lambda^{k+1})'*A(x^k-x^{k+1})
         cross_term = 2 * self.ρ * snp.dot(self.res.reshape(-1), (self.res_prev - self.res).reshape(-1))
         # Compute ||x^k-x^{k+1}||^2_G
         dx_norm = 0
         for i in range(self.N):
             diff = (self.x_list[i] - self.x_list_prev[i]).reshape(-1)
-            dx_norm += snp.linalg.norm(diff)**2 * self.τ
+            dx_norm += snp.linalg.norm(diff)**2 * self.τ[i]
         # Compute (2-gamma)/(rho*gamma^2)*||lambda^k-lambda^{k+1}||^2
         d_lambda_norm = (2 - self.γ) * self.ρ * snp.linalg.norm(self.res)**2
         # Compute the lower bound of error decrease: h(u^k,u^{k+1})
         lower_bound = dx_norm + d_lambda_norm + cross_term
 
+
+        # For tau, set it to 1.05 operator norm might be able to work.
         if lower_bound < 0:
-            # Less aggressive τ doubling - only increase by 1.5x instead of 2x
-            self.τ = self.τ * 2
+            print("τ is doubled at iteration ", self.itnum)
+
+            self.τ = [τ * 2 for τ in self.τ]
 
             # Revert back the variables.
             self.x_list = self.x_list_prev
@@ -492,19 +463,17 @@ class ProxJacobiBregmanADMM(Optimizer):
             self.res = self.res_prev.copy()
             self.x_list_prev = self.x_list_two_prev.copy()
             self.res_prev = self.res_two_prev.copy()
-        elif self.itnum % 50 == 0:
+        # # Note: This is a version that currently works, but stuck at a bad SNR. Don't change this.
+        elif self.itnum % 100 == 0:
             # Decrase τ after every a pre-defined number of iterations.
-            self.τ = self.τ / 1.5
+            self.τ = [τ / 1.2 for τ in self.τ]
+        # elif self.itnum % 20 == 0:
+        #     # Decrase τ after every a pre-defined number of iterations.
+        #     self.τ = [τ / 2 for τ in self.τ]
 
-        # # Synchronize the x_list after every 100 iters.
-        # # For the overlapping parts, average values are taken.
-        # if self.itnum % 100 == 0:
-        #     print("Average the overlapping parts....")
-        #     recon_full = self.recon_from_blocks()
-        #     self.x_list = self.divide_blocks(recon_full)
-
-        self.x_all.append(self.x_list.copy())
-        self.res_all.append(norm(self.res.reshape(-1), ord=2))
+        #################################################################################################
+        # Proximal parameters update ends here.
+        #################################################################################################
             
 
 
@@ -530,6 +499,9 @@ class ProxJacobiBregmanADMM(Optimizer):
         """
         self.timer.start()
         for self.itnum in range(self.itnum, self.itnum + self.maxiter):
+            if self.itnum == 100:
+                self.ρ = self.ρ * 10
+                self.tv_weight = self.tv_weight / 10
             self.step()
             if self.nanstop and not self._working_vars_finite():
                 raise ValueError(
@@ -545,4 +517,47 @@ class ProxJacobiBregmanADMM(Optimizer):
         self.timer.stop()
         self.itstat_object.end()
         
-        return self.minimizer(), self.x_all, self.res_all
+        return self.minimizer()
+
+
+
+    # This method is directly copied from _padmm.py, for estimating the parameters of the proximal Jacobi ADMM.
+    @staticmethod
+    def estimate_parameter(
+        A: LinearOperator,
+        rho: float,
+        factor: Optional[float] = 1.01,
+        maxiter: int = 100,
+        key: Optional[PRNGKey] = None,
+    ) -> float:
+        r"""Estimate `tau` parameter of :class:`ProxJacobiADMMv2`.
+
+        Find values of the `tau` parameter of :class:`ProxJacobiADMMv2`
+        that respect the constraints
+
+        .. math::
+           \tau > \norm{ A }_2^2
+
+        Args:
+            A: Linear operator :math:`A`.
+            B: Linear operator :math:`B` (if ``None``, :math:`B = -I`
+               where :math:`I` is the identity operator).
+            factor: Safety factor with which to multiply estimated
+               operator norms to ensure strict inequality compliance. If
+               ``None``, return the estimated squared operator norms.
+            maxiter: Maximum number of power iterations to use in operator
+               norm estimation (see :func:`.operator_norm`). Default: 100.
+            key: Jax PRNG key to use in operator norm estimation (see
+               :func:`.operator_norm`). Defaults to ``None``, in which
+               case a new key is created.
+
+        Returns:
+            'tau' representing the estimated parameter
+            values or corresponding squared operator norm values,
+            depending on the value of the `factor` parameter.
+        """
+        tau = operator_norm(A, maxiter=maxiter, key=key) ** 2
+        if factor is None:
+            return tau
+        else:
+            return factor * tau * rho
