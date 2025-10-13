@@ -28,11 +28,12 @@ import matplotlib.pyplot as plt
 '''
 Test for reconstruction for full 3D CT image with 
 naive way of dividing the image into blocks and reconstructing each block separately.
-ADMM and MBIRJAX are used to reconstruct each block.
+Proximal Jacobi ADMM is used to reconstruct the full image, with the initial guess using a full ADMM solver.
 '''
 def pjadmm_test(
-    Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2, do_block_recon=True, rho=1e-3, tau=0.1, tv_weight_second_stage=8e-3,
-    tv_weight_first_stage=1e-4, n_projection=30
+    Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2,
+    rho=1e-3, tau=0.1, tv_weight=8e-3, n_projection=30, 
+    maxiter_init=10, maxiter=1000
 ):
     '''
     Create a ground truth image and projector.
@@ -42,8 +43,8 @@ def pjadmm_test(
         Nx: Image width
         Ny: Image height  
         Nz: Image depth
-        row_division_num: Number of row divisions
-        col_division_num: Number of column divisions
+        row_division_num: Number of row divisions number
+        col_division_num: Number of column divisions number
     '''
     gpu_devices = jax.devices('gpu')
     print(f"Using {gpu_devices[0]} GPU")
@@ -55,11 +56,6 @@ def pjadmm_test(
     tangle = snp.array(jax.device_put(tangle, gpu_devices[0]))
 
     angles = np.linspace(0, np.pi, n_projection, endpoint=False)  # evenly spaced projection angles
-
-    # Define each ROI (Region of Interest) and its corresponding mbirjax projector
-    A_list = [] # List of mbirjax projectors for each ROI
-    g_list = [] # List of TV regularizers for each ROI
-
     sinogram_shape = (Nz, n_projection, max(Nx, Ny))
 
     # Create the full sinogram
@@ -71,6 +67,75 @@ def pjadmm_test(
     )
     y = A_full @ tangle
 
+    '''
+    Initialization process
+    For initial guess, instead of using the back projection, we use the a 
+    regular ADMM solver with less iterations to get the initial guess.
+    Parameters are the default ones for the ADMM solver.
+    '''
+    λ_init = 2e0  # ℓ2,1 norm regularization parameter
+    ρ_init = 5e0  # ADMM penalty parameter
+    maxiter_init = maxiter_init  # number of ADMM iterations
+    cg_tol_init = 1e-4  # CG relative tolerance
+    cg_maxiter_init = 25  # maximum CG iterations per ADMM iteration
+
+    # The append=0 option makes the results of horizontal and vertical
+    # finite differences the same shape, which is required for the L21Norm,
+    # which is used so that g(Ax) corresponds to isotropic TV.
+    D_init = linop.FiniteDifference(input_shape=tangle.shape, append=0)
+    g_init = λ_init * functional.L21Norm()
+    f_init = loss.SquaredL2Loss(y=y, A=A_full)
+
+    solver_init = ADMM(
+        f=f_init,
+        g_list=[g_init],
+        C_list=[D_init],
+        rho_list=[ρ_init],
+        x0=A_full.T(y),
+        maxiter=maxiter_init,
+        subproblem_solver=LinearSubproblemSolver(cg_kwargs={"tol": cg_tol_init, "maxiter": cg_maxiter_init}),
+        itstat_options={"display": True, "period": 5},
+    )
+
+    print("Initializing using ADMM solver...")
+    initial_guess = solver_init.solve()
+
+    # fig, ax = plot.subplots(nrows=1, ncols=2, figsize=(7, 6))
+    # plot.imview(
+    #     tangle[32],
+    #     title="Ground truth (central slice)",
+    #     cmap=plot.cm.Blues,
+    #     cbar=None,
+    #     fig=fig,
+    #     ax=ax[0],
+    # )
+    # plot.imview(
+    #     initial_guess[32],
+    #     title="TV Reconstruction (central slice)\nSNR: %.2f (dB), MAE: %.3f"
+    #     % (metric.snr(tangle, initial_guess), metric.mae(tangle, initial_guess)),
+    #     cmap=plot.cm.Blues,
+    #     fig=fig,
+    #     ax=ax[1],
+    # )
+    # divider = make_axes_locatable(ax[1])
+    # cax = divider.append_axes("right", size="5%", pad=0.2)
+    # fig.colorbar(ax[1].get_images()[0], cax=cax, label="arbitrary units")
+    # results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_good_initial_{row_division_num}_{col_division_num}')
+    # os.makedirs(results_dir, exist_ok=True)
+    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_good_initial_initial_guess.png')
+    # fig.savefig(save_path)
+    # fig.show()
+
+
+    '''
+    Set up problems and solvers for TV regularized solver, block reconstruction using proximal Jacobi ADMM.
+    '''
+    # Define each ROI (Region of Interest) and its corresponding mbirjax projector
+    A_list = [] # List of mbirjax projectors for each ROI
+    # Cut the initial guess into corresponding blocks.
+    x0_list = []
+
+    # Set up the ROI indices for each ROI.
     row_start_indices = []
     col_start_indices = []
     row_end_indices = []
@@ -86,9 +151,7 @@ def pjadmm_test(
             col_start_indices.append(roi_start_col)
             row_end_indices.append(roi_end_row)
             col_end_indices.append(roi_end_col)
-
             assert roi_start_row >= 0 and roi_start_col >= 0 and roi_end_row <= Nx and roi_end_col <= Ny
-
             roi_indices = create_roi_indices(Nx, Ny, roi_start_row, roi_end_row, roi_start_col, roi_end_col)
 
             # Create the mbirjax projector for the current ROI
@@ -100,29 +163,19 @@ def pjadmm_test(
                 roi_recon_shape=(roi_end_row - roi_start_row, roi_end_col - roi_start_col, Nz),
                 recon_shape=(Nx, Ny, Nz)
             )
-
-            # g = IsotropicTVNorm(input_shape=A.input_shape, input_dtype=A.input_dtype)
-            # g = L1Norm()
-
-            # Append the mbirjax projector and sinogram to the list
+            # Append the mbirjax projector to the list
             A_list.append(A)
-            # g_list.append(g)
 
-    # For initial guess, instead of using the back projection, 
-    # we use the a regular ADMM solver with less iterations to get the initial guess.
-    admm_solver = ADMM(
-        f=loss.SquaredL2Loss(y=y, A=A),
-        g_list=[IsotropicTVNorm(input_shape=A.input_shape, input_dtype=A.input_dtype)],
-        C_list=[A],
-        rho_list=[ρ],
-    )
-    initial_guess = admm_solver.solve()
+            # Cut the initial guess into corresponding blocks.
+            x0_block = initial_guess[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row]
+            x0_list.append(x0_block)
 
-    """
-    Set up problems and solvers for tv regularized solver, second stage.
-    """
+    # Define the TV regularizer for each ROI in the later block reconstruction.
+    g_list = [IsotropicTVNorm(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]
+
+
     ################################################################################################################
-    # # This is the best setting for the problem of size 128*256*64.
+    # # This is the best setting for the problem of large size.
     # In the Proximal Jacobi ADMM solver, tau is updated as 
     # if lower_bound < 0:
     #     print("τ is doubled at iteration ", self.itnum)
@@ -141,26 +194,27 @@ def pjadmm_test(
     #     # Decrase τ after every a pre-defined number of iterations.
     #     self.τ = self.τ / 1.2
 
-    # ρ = 1e-3
+    # The minimization parameter setting is as follows:
+    # ρ = 1e-4
     # τ = 0.1
-    # tv_weight = 8e-3
+    # tv_weight = 1e-2
     ################################################################################################################
     ρ = rho
     τ = tau
-    tv_weight = tv_weight_second_stage
+    tv_weight = tv_weight
 
     
-    γ = 1  # Damping parameter
+    γ = 1  # Damping parameter in the proximal Jacobi ADMM solver, in the update of the dual variable.
     λ = snp.zeros(A_list[0].output_shape, dtype=A_list[0].output_dtype)  # Dual variable
     correction = False
-    α = 0.8 if correction else None
-    maxiter = 1000  # number of decentralized ADMM iterations
+    α = 0.8 if correction else None      # Relaxation parameter in the proximal Jacobi ADMM solver, in the correction step. Currently not used.
+    maxiter = maxiter  # number of decentralized ADMM iterations
 
     print(f"ρ: {ρ}, τ: {τ}, regularization: {tv_weight}, γ: {γ}, correction: {correction}, α: {α}, maxiter: {maxiter}")
 
     test_mode = True
 
-    tv_solver_2 = ProxJacobiADMM(
+    tv_solver = ProxJacobiADMM(
         A_list=A_list,
         g_list=g_list,
         ρ=ρ,
@@ -168,7 +222,7 @@ def pjadmm_test(
         τ=τ,
         γ=γ,
         λ=λ,
-        x0_list=tangle_recon_list,
+        x0_list=x0_list,
         display_period = 1,
         device = gpu_devices[0],
         with_correction = correction,
@@ -183,26 +237,11 @@ def pjadmm_test(
     )
 
     """
-    Run the l1 regularized solver.
+    Run the TV regularized solver, block reconstruction.
     """
     print(f"Solving on {device_info()}\n")
-    tangle_recon_list = tv_solver_2.solve()
-
-    # save_path = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_2stages_{row_division_num}_{col_division_num}')
-    # os.makedirs(save_path, exist_ok=True)
-    # snp.save(os.path.join(save_path, 'x_all.npy'), x_all)
-    # snp.save(os.path.join(save_path, 'res_all.npy'), res_all)
-
-    # iters = np.arange(len(res_all))
-    # plt.plot(iters, res_all, label='Residual', marker='o')
-    # plt.legend()
-    # plt.show()
-    # plt.savefig(os.path.join(save_path, 'res_all.pdf'))
-
+    tangle_recon_list = tv_solver.solve()
     
-
-
-
 
     '''
     Reconstruct the full image
@@ -244,9 +283,11 @@ def pjadmm_test(
     fig.colorbar(ax[1].get_images()[0], cax=cax, label="arbitrary units")
     fig.show()
 
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_2stages_{row_division_num}_{col_division_num}')
+    # Save the figure
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_good_initial_{row_division_num}_{col_division_num}')
     os.makedirs(results_dir, exist_ok=True)
-    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_2stages_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}.png')
+    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_good_initial_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_initial_maxiter{maxiter_init}_maxiter{maxiter}_tempered_τ.png')
+    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_good_initial_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_initial_maxiter{maxiter_init}_maxiter{maxiter}.png')
     fig.savefig(save_path)   # save the figure to file
 
 
@@ -270,22 +311,22 @@ if __name__ == "__main__":
                        help='Image height (default: 256)')
     parser.add_argument('-z', '--Nz', type=int, default=64,
                        help='Image depth (default: 64)')
-    parser.add_argument('--row_division', type=int, default=4,
-                       help='Number of row divisions (default: 4)')
-    parser.add_argument('--col_division', type=int, default=8,
-                       help='Number of column divisions (default: 8)')
-    parser.add_argument('--do_block_recon', action='store_true', default=True,
-                    help='Perform block reconstruction (default: enabled)')
-    parser.add_argument('--no_block_recon', action='store_false', dest='do_block_recon',
-                    help='Disable block reconstruction')
+    parser.add_argument('--row_division_num', type=int, default=2,
+                       help='Number of row divisions (default: 2)')
+    parser.add_argument('--col_division_num', type=int, default=2,
+                       help='Number of column divisions (default: 2)')
     parser.add_argument('--rho', type=float, default=1e-3,
                        help='Regularization parameter (default: 1e-3)')
     parser.add_argument('--tau', type=float, default=0.1,
                        help='Step size parameter (default: 0.1)')
-    parser.add_argument('--tv_weight_second_stage', type=float, default=8e-3,
+    parser.add_argument('--tv_weight', type=float, default=8e-3,
                        help='TV regularization weight (default: 8e-3)')
     parser.add_argument('--n_projection', type=int, default=30,
                        help='Number of projections (default: 30)')
+    parser.add_argument('--maxiter_init', type=int, default=10,
+                       help='Number of iterations for initial guess (default: 10)')
+    parser.add_argument('--maxiter', type=int, default=1000,
+                       help='Number of iterations for block reconstruction (default: 1000)')
     # Parse arguments
     args = parser.parse_args()
     
@@ -293,7 +334,7 @@ if __name__ == "__main__":
     if args.Nx <= 0 or args.Ny <= 0 or args.Nz <= 0:
         parser.error("Image dimensions must be positive integers")
     
-    if args.row_division <= 0 or args.col_division <= 0:
+    if args.row_division_num <= 0 or args.col_division_num <= 0:
         parser.error("Division numbers must be positive integers")
     
     # Display configuration
@@ -302,11 +343,12 @@ if __name__ == "__main__":
     print("="*100)
     print(f"Configuration:")
     print(f"  Image dimensions: {args.Nx}x{args.Ny}x{args.Nz}")
-    print(f"  Block division: {args.row_division}x{args.col_division}")
-    print(f"  Block reconstruction: {args.do_block_recon}")
-    print(f"  Block size: {args.Nx // args.row_division}x{args.Ny // args.col_division}x{args.Nz}")
-    print(f"  Total blocks: {args.row_division * args.col_division}")
+    print(f"  Block division number: {args.row_division_num}x{args.col_division_num}")
+    print(f"  Block size: {args.Nx // args.row_division_num}x{args.Ny // args.col_division_num}x{args.Nz}")
+    print(f"  Total blocks: {args.row_division_num * args.col_division_num}")
     print(f"  Number of projections: {args.n_projection}")
+    print(f"  Number of iterations for initial guess: {args.maxiter_init}")
+    print(f"  Number of iterations for block reconstruction: {args.maxiter}")
     print("="*80)
     
     # Run the test
@@ -319,12 +361,13 @@ if __name__ == "__main__":
         Nx=args.Nx,
         Ny=args.Ny,
         Nz=args.Nz,
-        row_division_num=args.row_division,
-        col_division_num=args.col_division,
-        do_block_recon=args.do_block_recon,
+        row_division_num=args.row_division_num,
+        col_division_num=args.col_division_num,
         rho=args.rho,
         tau=args.tau,
-        tv_weight_second_stage=args.tv_weight_second_stage,
-        n_projection=args.n_projection
+        tv_weight=args.tv_weight,
+        n_projection=args.n_projection,
+        maxiter_init=args.maxiter_init,
+        maxiter=args.maxiter
     )
     print("\n✅ Test completed!")

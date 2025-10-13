@@ -42,65 +42,9 @@ class ProxJacobiADMM(Optimizer):
     r"""Proximal Jacobi Alternating Direction Method of Multipliers (ADMM) algorithm.
     For reference, see https://link.springer.com/article/10.1007/s10915-016-0318-2.
 
-    |
+    TODO: Write the documentation more comprehensively.
 
-    Solve an optimization problem of the form
-
-    .. math::
-        \argmin_{\mb{x}} \; f(\mb{x}) + \sum_{i=1}^N g_i(C_i \mb{x}) \;,
-
-    where :math:`f` and the :math:`g_i` are instances of
-    :class:`.Functional`, and the :math:`C_i` are
-    :class:`.LinearOperator`.
-
-    The optimization problem is solved by introducing the splitting
-    :math:`\mb{z}_i = C_i \mb{x}` and solving
-
-    .. math::
-        \argmin_{\mb{x}, \mb{z}_i} \; f(\mb{x}) + \sum_{i=1}^N
-        g_i(\mb{z}_i) \; \text{such that}\; C_i \mb{x} = \mb{z}_i \;,
-
-    via an ADMM algorithm :cite:`glowinski-1975-approximation`
-    :cite:`gabay-1976-dual` :cite:`boyd-2010-distributed` consisting of
-    the iterations (see :meth:`step`)
-
-    .. math::
-       \begin{aligned}
-       \mb{x}^{(k+1)} &= \argmin_{\mb{x}} \; f(\mb{x}) + \sum_i
-       \frac{\rho_i}{2} \norm{\mb{z}^{(k)}_i - \mb{u}^{(k)}_i - C_i
-       \mb{x}}_2^2 \\
-       \mb{z}_i^{(k+1)} &= \argmin_{\mb{z}_i} \; g_i(\mb{z}_i) +
-       \frac{\rho_i}{2}
-       \norm{\mb{z}_i - \mb{u}^{(k)}_i - C_i \mb{x}^{(k+1)}}_2^2  \\
-       \mb{u}_i^{(k+1)} &=  \mb{u}_i^{(k)} + C_i \mb{x}^{(k+1)} -
-       \mb{z}^{(k+1)}_i  \; .
-       \end{aligned}
-
-
-    Attributes:
-        f_list (list of :class:`.Functional`): List of :math:`f_i` 
-            functionals. Must be same length as :code:`D_list` and
-            :code:`rho_list`.
-        g_list (list of :class:`.Functional`): List of :math:`g_i`
-            functionals. Must be same length as :code:`D_list` and
-            :code:`rho_list`.
-        D_list (list of :class:`.LinearOperator`): List of :math:`C_i`
-            operators.
-        rho_list (list of scalars): List of :math:`\rho_i` penalty
-            parameters. Must be same length as :code:`D_list` and
-            :code:`g_list`.
-        alpha (float): Relaxation parameter.
-        u_list (list of array-like): List of scaled Lagrange multipliers
-            :math:`\mb{u}_i` at current iteration.
-        x (array-like): Solution.
-        subproblem_solver (:class:`.SubproblemSolver`): Solver for
-            :math:`\mb{x}`-update step.
-        z_list (list of array-like): List of auxiliary variables
-            :math:`\mb{z}_i` at current iteration.
-        z_list_old (list of array-like): List of auxiliary variables
-            :math:`\mb{z}_i` at previous iteration.
     """
-
     def __init__(
         self,
         A_list: List[LinearOperator],
@@ -124,7 +68,7 @@ class ProxJacobiADMM(Optimizer):
         col_division_num: int = 8,
         **kwargs,
     ):
-        r"""Initialize an :class:`ADMM` object.
+        r"""Initialize an :class:`ProxJacobiADMM` object.
 
         Args:
             A_list: List of :math:`A_i` operators, represents the partial
@@ -364,27 +308,14 @@ class ProxJacobiADMM(Optimizer):
         optimization problem
 
         .. math::
-            \mb{x}^{(k+1)} = \argmin_{\mb{x}} \; f(\mb{x}) + \sum_i
-            \frac{\rho_i}{2} \norm{\mb{z}^{(k)}_i - \mb{u}^{(k)}_i -
-            C_i \mb{x}}_2^2 \;.
+            \mb{x}^{(k+1)} = \argmin_{x_i} \|x_i\|_1 + 
+            \left\langle \rho A_i^T \left( Ax^k - y - \frac{\lambda^k}{\rho} \right), x_i \right\rangle 
+            + \frac{\tau_i}{2} \|x_i - x^k_i\|_2^2\;.
 
-        Update auxiliary variables :math:`\mb{z}_i` and scaled Lagrange
-        multipliers :math:`\mb{u}_i`. The auxiliary variables are updated
-        according to
+        Update the scaled Lagrange multipliers :math:`\mb{\lambda}_i` according to
 
         .. math::
-            \begin{aligned}
-            \mb{z}_i^{(k+1)} &= \argmin_{\mb{z}_i} \; g_i(\mb{z}_i) +
-            \frac{\rho_i}{2} \norm{\mb{z}_i - \mb{u}^{(k)}_i - C_i
-            \mb{x}^{(k+1)}}_2^2  \\
-            &= \mathrm{prox}_{g_i}(C_i \mb{x} + \mb{u}_i, 1 / \rho_i) \;,
-            \end{aligned}
-
-        and the scaled Lagrange multipliers are updated according to
-
-        .. math::
-            \mb{u}_i^{(k+1)} =  \mb{u}_i^{(k)} + C_i \mb{x}^{(k+1)} -
-            \mb{z}^{(k+1)}_i \;.
+            \mb{\lambda}_i^{(k+1)} =  \mb{\lambda}_i^{(k)} - \gamma \rho_i (\sum_{i=1}^N A_i x^k - y)\;.
         """
         # Store the previous two iterations' x, dual variable λ, and residual.
         self.x_list_two_prev = self.x_list_prev.copy()
@@ -436,6 +367,7 @@ class ProxJacobiADMM(Optimizer):
 
 
         # For tau, set it to 1.05 operator norm might be able to work.
+        # if lower_bound < 0 and self.itnum < 100:
         if lower_bound < 0:
             print("τ is doubled at iteration ", self.itnum)
             self.τ = self.τ * 2
@@ -449,12 +381,13 @@ class ProxJacobiADMM(Optimizer):
             self.res = self.res_prev.copy()
             self.x_list_prev = self.x_list_two_prev.copy()
             self.res_prev = self.res_two_prev.copy()
-        elif self.itnum % 50 == 0:
+        # NOTE: Don't change this elif below. It's the default setting.
+        elif self.itnum % 10 == 0:
             # Decrase τ after every a pre-defined number of iterations.
-            self.τ = self.τ / 1.5
-
-        # self.x_all.append(self.x_list.copy())
-        # self.res_all.append(norm(self.res.reshape(-1), ord=2))
+            self.τ = self.τ / 1.2
+        # elif self.itnum % 50 == 0:
+        #     # Decrase τ after every a pre-defined number of iterations.
+        #     self.τ = self.τ / 1.2
             
 
 
