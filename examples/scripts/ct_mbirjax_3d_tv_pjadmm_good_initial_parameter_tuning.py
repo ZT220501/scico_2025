@@ -1,5 +1,6 @@
 import numpy as np
 import jax
+import jax.profiler
 import os
 
 # Force GPU usage
@@ -240,8 +241,8 @@ def pjadmm_test(
     Run the TV regularized solver, block reconstruction.
     """
     print(f"Solving on {device_info()}\n")
+
     tangle_recon_list = tv_solver.solve()
-    
 
     '''
     Reconstruct the full image
@@ -284,14 +285,38 @@ def pjadmm_test(
     fig.show()
 
     # Save the figure
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_good_initial_{row_division_num}_{col_division_num}')
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_good_initial_parameter_tuning')
     os.makedirs(results_dir, exist_ok=True)
     # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_good_initial_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_initial_maxiter{maxiter_init}_maxiter{maxiter}_tempered_τ.png')
     save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_good_initial_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_initial_maxiter{maxiter_init}_maxiter{maxiter}.png')
     fig.savefig(save_path)   # save the figure to file
 
 
-    print(f"Final SNR: {round(metric.snr(tangle, tangle_recon), 2)} (dB), Final MAE: {round(metric.mae(tangle, tangle_recon), 3)}")
+    # Calculate final metrics
+    final_snr = round(metric.snr(tangle, tangle_recon), 2)
+    final_mae = round(metric.mae(tangle, tangle_recon), 3)
+    
+    print(f"Final SNR: {final_snr} (dB), Final MAE: {final_mae}")
+    
+    # Write metrics to text file based on image size
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_good_initial_parameter_tuning/snr_mae')
+    os.makedirs(results_dir, exist_ok=True)
+    
+    # Create filename based on image size
+    metrics_filename = f'shape_{Nx}x{Ny}x{Nz}.txt'
+    metrics_filepath = os.path.join(results_dir, metrics_filename)
+    
+    # Write metrics to file
+    with open(metrics_filepath, 'a') as f:
+        f.write(f"Parameters: ρ={ρ}, τ={τ}, tv_weight={tv_weight}, γ={γ}, ")
+        f.write(f"Iterations: initial_maxiter={maxiter_init}, maxiter={maxiter}, ")
+        f.write(f"Projections: {n_projection}, ")
+        f.write(f"Divisions: {row_division_num}x{col_division_num}\n")
+        f.write(f"Final SNR: {final_snr} (dB), ")
+        f.write(f"Final MAE: {final_mae}, ")
+        f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    print(f"Metrics saved to: {metrics_filepath}")
 
     return tangle_recon
 
@@ -315,12 +340,9 @@ if __name__ == "__main__":
                        help='Number of row divisions (default: 2)')
     parser.add_argument('--col_division_num', type=int, default=2,
                        help='Number of column divisions (default: 2)')
-    parser.add_argument('--rho', type=float, default=1e-3,
-                       help='Regularization parameter (default: 1e-3)')
+    # Fix tau in the parameter tuning and tune the rho and tv_weight parameters.
     parser.add_argument('--tau', type=float, default=0.1,
                        help='Step size parameter (default: 0.1)')
-    parser.add_argument('--tv_weight', type=float, default=8e-3,
-                       help='TV regularization weight (default: 8e-3)')
     parser.add_argument('--n_projection', type=int, default=30,
                        help='Number of projections (default: 30)')
     parser.add_argument('--maxiter_init', type=int, default=10,
@@ -337,37 +359,27 @@ if __name__ == "__main__":
     if args.row_division_num <= 0 or args.col_division_num <= 0:
         parser.error("Division numbers must be positive integers")
     
-    # Display configuration
-    print("="*100)
-    print("3D TV-Regularized Sparse-View CT Reconstruction (Proximal Jacobi Overlapped ADMM Solver) using MBIRJAX")
-    print("="*100)
-    print(f"Configuration:")
-    print(f"  Image dimensions: {args.Nx}x{args.Ny}x{args.Nz}")
-    print(f"  Block division number: {args.row_division_num}x{args.col_division_num}")
-    print(f"  Block size: {args.Nx // args.row_division_num}x{args.Ny // args.col_division_num}x{args.Nz}")
-    print(f"  Total blocks: {args.row_division_num * args.col_division_num}")
-    print(f"  Number of projections: {args.n_projection}")
-    print(f"  Number of iterations for initial guess: {args.maxiter_init}")
-    print(f"  Number of iterations for block reconstruction: {args.maxiter}")
-    print("="*80)
     
     # Run the test
     print("\n" + "="*80)
-    print("TEST: Block Proximal Jacobi ADMM test")
+    print("TEST: Block Proximal Jacobi ADMM parameter tuning")
     print("="*80)
     
+    for rho in [1e-3, 5e-4, 1e-4]:
+        for tv_weight in [1e-1, 1e-2]:
+            print(f"Testing with rho: {rho}, tv_weight: {tv_weight}")            
+            test_results = pjadmm_test(
+                Nx=args.Nx,
+                Ny=args.Ny,
+                Nz=args.Nz,
+                row_division_num=args.row_division_num,
+                col_division_num=args.col_division_num,
+                rho=rho,
+                tau=args.tau,
+                tv_weight=tv_weight,
+                n_projection=args.n_projection,
+                maxiter_init=args.maxiter_init,
+                maxiter=args.maxiter
+            )
 
-    test_results = pjadmm_test(
-        Nx=args.Nx,
-        Ny=args.Ny,
-        Nz=args.Nz,
-        row_division_num=args.row_division_num,
-        col_division_num=args.col_division_num,
-        rho=args.rho,
-        tau=args.tau,
-        tv_weight=args.tv_weight,
-        n_projection=args.n_projection,
-        maxiter_init=args.maxiter_init,
-        maxiter=args.maxiter
-    )
     print("\n✅ Test completed!")

@@ -98,8 +98,6 @@ class XRayTransformParallel(LinearOperator):
             output_shape=output_shape,
             input_dtype=np.float32,
             output_dtype=np.float32,
-            # eval_fn=self._eval,
-            # adj_fn=self._adj,
             eval_fn=self.project,
             adj_fn=self.back_project,
             jit=jit,
@@ -112,6 +110,16 @@ class XRayTransformParallel(LinearOperator):
     
     def back_project(self, y: snp.Array) -> snp.Array:
         return self._bproj(y, self.indices, self.model.get_params("angles"), self.projector_params, coeff_power=1)
+
+    def fbp_recon(self, y: snp.Array) -> snp.Array:
+        y = y.transpose(1, 0, 2)
+        view_batch_size = len(self.model.get_params("angles"))
+
+        recon = self.model.fbp_recon(y, view_batch_size=view_batch_size, filter_name="ramp")
+        print(f"Recon shape: {recon.shape}")
+        # Transpose the recon from mbirjax convention to scico convention.
+        recon = recon.transpose(2, 1, 0)
+        return snp.array(recon)
 
     @staticmethod
     def _proj(
@@ -142,26 +150,6 @@ class XRayTransformParallel(LinearOperator):
         sinogram = sinogram.transpose(1, 0, 2)
         return snp.array(sinogram)
 
-    # def _proj_hcb(self, x: snp.Array) -> snp.Array:
-    #     """
-    #     Host callback wrapper for forward projection.
-    #     """
-    #     # Transpose the input to match the mbirjax convention.
-    #     x = x.transpose(2, 1, 0)
-    #     # This put the stuff out of the GPU and to the CPU.
-    #     # TODO: Fix this; maybe not use pure_callback?
-    #     y = jax.pure_callback(
-    #         lambda x: self._proj(
-    #             np.array(x),
-    #             self.indices,
-    #             self.model.get_params("angles"),
-    #             self.projector_params,
-    #         ),
-    #         jax.ShapeDtypeStruct(self.output_shape, self.output_dtype),
-    #         x,
-    #     )
-
-    #     return y
 
     @staticmethod
     def _bproj(
@@ -205,24 +193,9 @@ class XRayTransformParallel(LinearOperator):
         recon = recon.reshape(input_shape)
         recon = recon.transpose(2, 1, 0)
         return snp.array(recon)
-    
-    # def _bproj_hcb(self, y: snp.Array) -> snp.Array:
-    #     """
-    #     Host callback wrapper for backward projection.
-    #     """
-    #     x = jax.pure_callback(
-    #         lambda y: self._bproj(
-    #             np.array(y),
-    #             self.indices,
-    #             self.model.get_params("angles"),
-    #             self.projector_params,
-    #             coeff_power=1,
-    #         ),
-    #         jax.ShapeDtypeStruct(self.input_shape, self.input_dtype),
-    #         y,
-    #     )
-    #     return x
-    
+
+
+
     def get_params(self, parameter_names=None) -> Any:
         if parameter_names is None:
             return self.projector_params

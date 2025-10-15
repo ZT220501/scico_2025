@@ -211,7 +211,7 @@ class ProxJacobiADMM(Optimizer):
         Aix_list = []
         for i, x_i in enumerate(self.x_list):
             Aix = self.A_list[i](x_i)
-            Aix = jax.device_put(Aix, self.device)
+            # Aix = jax.device_put(Aix, self.device)
             Aix_list.append(Aix)
 
         out += self.ρ * snp.linalg.norm(sum(Aix_list) - self.y) ** 2 / 2
@@ -221,7 +221,7 @@ class ProxJacobiADMM(Optimizer):
     def tv(self) -> float:
         out = 0.0
         for i in range(self.N):
-            out += self.g_list[i](self.x_list[i])
+            out += self.tv_weight * self.g_list[i](self.x_list[i])
         return out
 
     def objective(self) -> float:
@@ -333,18 +333,18 @@ class ProxJacobiADMM(Optimizer):
             grad = self.ρ * self.A_list[i].T(Ax_k - self.y - self.λ / self.ρ)
             # Proximal operator update of the TV norm.
             self.x_list[i] = self.g_list[i].prox(self.x_list[i] - 1 / self.τ * grad, self.tv_weight / self.τ)
-            self.x_list[i] = snp.array(jax.device_put(self.x_list[i], self.device))
+            # self.x_list[i] = snp.array(jax.device_put(self.x_list[i], self.device))
         
         # Update the residual.
         # Notice that this in fact can be done parallelly in practice, on self.N GPUs!
         self.res = sum(self.A_list[i](self.x_list[i]) for i in range(self.N)) - self.y
-        self.res = jax.device_put(self.res, self.device)
+        # self.res = jax.device_put(self.res, self.device)
 
         # Update dual variable λ
         # Notice that in practice, only A_ix_i-y needs to be distributed, which has much smaller size than the full image.
         # This part might be accelerated further.
         self.λ = self.λ - self.γ * self.ρ * (sum(self.A_list[i](self.x_list[i]) for i in range(self.N)) - self.y)
-        self.λ = jax.device_put(self.λ, self.device)
+        # self.λ = jax.device_put(self.λ, self.device)
 
         if self.with_correction:
             # Compute the correction step.
@@ -375,7 +375,7 @@ class ProxJacobiADMM(Optimizer):
             # Revert back the variables.
             self.x_list = self.x_list_prev
             self.λ = self.λ + self.γ * self.ρ * (sum(self.A_list[i](self.x_list[i]) for i in range(self.N)) - self.y)
-            self.λ = jax.device_put(self.λ, self.device)
+            # self.λ = jax.device_put(self.λ, self.device)
             # Revert back the stored variables.
             self.x_list = self.x_list_prev.copy()
             self.res = self.res_prev.copy()

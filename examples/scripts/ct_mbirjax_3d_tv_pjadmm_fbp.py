@@ -30,10 +30,9 @@ Test for reconstruction for full 3D CT image with
 naive way of dividing the image into blocks and reconstructing each block separately.
 Proximal Jacobi ADMM is used to reconstruct the full image, with the initial guess using a full ADMM solver.
 '''
-def pjadmm_test(
+def pjadmm_fbp_test(
     Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2,
-    rho=1e-3, tau=0.1, tv_weight=8e-3, n_projection=30, 
-    maxiter_init=10, maxiter=1000
+    rho=1e-3, tau=0.1, tv_weight=8e-3, n_projection=30, maxiter=1000
 ):
     '''
     Create a ground truth image and projector.
@@ -67,65 +66,7 @@ def pjadmm_test(
     )
     y = A_full @ tangle
 
-    '''
-    Initialization process
-    For initial guess, instead of using the back projection, we use the a 
-    regular ADMM solver with less iterations to get the initial guess.
-    Parameters are the default ones for the ADMM solver.
-    '''
-    λ_init = 2e0  # ℓ2,1 norm regularization parameter
-    ρ_init = 5e0  # ADMM penalty parameter
-    maxiter_init = maxiter_init  # number of ADMM iterations
-    cg_tol_init = 1e-4  # CG relative tolerance
-    cg_maxiter_init = 25  # maximum CG iterations per ADMM iteration
-
-    # The append=0 option makes the results of horizontal and vertical
-    # finite differences the same shape, which is required for the L21Norm,
-    # which is used so that g(Ax) corresponds to isotropic TV.
-    D_init = linop.FiniteDifference(input_shape=tangle.shape, append=0)
-    g_init = λ_init * functional.L21Norm()
-    f_init = loss.SquaredL2Loss(y=y, A=A_full)
-
-    solver_init = ADMM(
-        f=f_init,
-        g_list=[g_init],
-        C_list=[D_init],
-        rho_list=[ρ_init],
-        x0=A_full.T(y),
-        maxiter=maxiter_init,
-        subproblem_solver=LinearSubproblemSolver(cg_kwargs={"tol": cg_tol_init, "maxiter": cg_maxiter_init}),
-        itstat_options={"display": True, "period": 5},
-    )
-
-    print("Initializing using ADMM solver...")
-    initial_guess = solver_init.solve()
-
-    # fig, ax = plot.subplots(nrows=1, ncols=2, figsize=(7, 6))
-    # plot.imview(
-    #     tangle[32],
-    #     title="Ground truth (central slice)",
-    #     cmap=plot.cm.Blues,
-    #     cbar=None,
-    #     fig=fig,
-    #     ax=ax[0],
-    # )
-    # plot.imview(
-    #     initial_guess[32],
-    #     title="TV Reconstruction (central slice)\nSNR: %.2f (dB), MAE: %.3f"
-    #     % (metric.snr(tangle, initial_guess), metric.mae(tangle, initial_guess)),
-    #     cmap=plot.cm.Blues,
-    #     fig=fig,
-    #     ax=ax[1],
-    # )
-    # divider = make_axes_locatable(ax[1])
-    # cax = divider.append_axes("right", size="5%", pad=0.2)
-    # fig.colorbar(ax[1].get_images()[0], cax=cax, label="arbitrary units")
-    # results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_good_initial_{row_division_num}_{col_division_num}')
-    # os.makedirs(results_dir, exist_ok=True)
-    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_good_initial_initial_guess.png')
-    # fig.savefig(save_path)
-    # fig.show()
-
+    initial_guess = A_full.fbp_recon(y)
 
     '''
     Set up problems and solvers for TV regularized solver, block reconstruction using proximal Jacobi ADMM.
@@ -284,10 +225,9 @@ def pjadmm_test(
     fig.show()
 
     # Save the figure
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_good_initial_{row_division_num}_{col_division_num}')
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_fbp_{row_division_num}_{col_division_num}')
     os.makedirs(results_dir, exist_ok=True)
-    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_good_initial_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_initial_maxiter{maxiter_init}_maxiter{maxiter}_tempered_τ.png')
-    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_good_initial_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_initial_maxiter{maxiter_init}_maxiter{maxiter}.png')
+    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
     fig.savefig(save_path)   # save the figure to file
 
 
@@ -323,8 +263,6 @@ if __name__ == "__main__":
                        help='TV regularization weight (default: 8e-3)')
     parser.add_argument('--n_projection', type=int, default=30,
                        help='Number of projections (default: 30)')
-    parser.add_argument('--maxiter_init', type=int, default=10,
-                       help='Number of iterations for initial guess (default: 10)')
     parser.add_argument('--maxiter', type=int, default=1000,
                        help='Number of iterations for block reconstruction (default: 1000)')
     # Parse arguments
@@ -347,7 +285,6 @@ if __name__ == "__main__":
     print(f"  Block size: {args.Nx // args.row_division_num}x{args.Ny // args.col_division_num}x{args.Nz}")
     print(f"  Total blocks: {args.row_division_num * args.col_division_num}")
     print(f"  Number of projections: {args.n_projection}")
-    print(f"  Number of iterations for initial guess: {args.maxiter_init}")
     print(f"  Number of iterations for block reconstruction: {args.maxiter}")
     print("="*80)
     
@@ -357,7 +294,7 @@ if __name__ == "__main__":
     print("="*80)
     
 
-    test_results = pjadmm_test(
+    test_results = pjadmm_fbp_test(
         Nx=args.Nx,
         Ny=args.Ny,
         Nz=args.Nz,
@@ -367,7 +304,6 @@ if __name__ == "__main__":
         tau=args.tau,
         tv_weight=args.tv_weight,
         n_projection=args.n_projection,
-        maxiter_init=args.maxiter_init,
         maxiter=args.maxiter
     )
     print("\n✅ Test completed!")

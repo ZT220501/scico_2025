@@ -252,3 +252,174 @@ class AcceleratedPGM(PGM):
     def _state_variable_names(self) -> List[str]:
         """Get optimizer state variable names."""
         return ["x", "v", "t", "L"]
+
+
+
+
+
+
+
+class ParallelPGM(Optimizer):
+    r"""Proximal gradient method (PGM) algorithm, with parallelized implementation.
+
+    Minimize a functional of the form :math:`1/2\sum_{i=1}^N\|\mb{A_i x} - \mb{y_i}\|_2^2 + \sum_{i=1}^N g_i(\mb{x})`,
+    where :math:`A` is a linear operator and the :math:`g_i` are instances of
+    :class:`.Functional`. Functional :math:`g` should have a proximal operator defined.
+
+    In general we can replace the constraint term with f(\mb{x}) where f is an instance of
+    :class:`.Functional`, but here we keep the constraint term for simplicity.
+
+    The step size :math:`\alpha` of the algorithm is defined in terms of
+    its reciprocal :math:`L`, i.e. :math:`\alpha = 1 / L`. The initial
+    value for this parameter, `L0`, is required to satisfy
+
+    .. math::
+       L_0 \geq K(\nabla f) \;,
+
+    where :math:`K(\nabla f)` denotes the Lipschitz constant of the
+    gradient of :math:`f`. Here `f` is an instance of
+    :class:`.SquaredL2Loss` with a :class:`.LinearOperator` `A`,
+
+    .. math::
+       K(\nabla f) = \lambda_{ \mathrm{max} }( A^H A ) = \| A \|_2^2 \;,
+
+    where :math:`\lambda_{\mathrm{max}}(B)` denotes the largest
+    eigenvalue of :math:`B`.
+
+    The evolution of the step size is controlled by auxiliary class
+    :class:`.PGMStepSize` and derived classes. The default
+    :class:`.PGMStepSize` simply sets :math:`L = L_0`, while the derived
+    classes implement a variety of adaptive strategies.
+    """
+
+    def __init__(
+        self,
+        A_list: List[Union[Loss, Functional]],
+        g_list: List[Functional],
+        y: float,
+        L0: float,
+        x0_list: List[Union[Array, BlockArray]],
+        step_size: Optional[PGMStepSize] = None,
+        device: Optional[jax.Device] = None,
+        **kwargs,
+    ):
+        r"""
+
+        Args:
+            A_list: List of instances of linear operators that represent the partial 
+                forward sinogram projection operators of each block.
+            g_list: List of instances of :class:`.Functional` with defined prox method.
+            y: The ground truth full sinogram.
+            L0: Initial estimate of Lipschitz constant of gradient of `f`.
+            x0_list: List of starting point for :math:`\mb{x}`.
+            step_size: Instance of an auxiliary class of type
+                :class:`.PGMStepSize` determining the evolution of the
+                algorithm step size.
+            **kwargs: Additional optional parameters handled by
+                initializer of base class :class:`.Optimizer`.
+        """
+        #: Functionals or Losses to minimize; must have grad method defined for each element.
+        self.A_list: List[Union[Loss, Functional]] = A_list
+        self.N = len(A_list)
+        if len(g_list) != self.N:
+            raise ValueError(f"len(g_list)={len(g_list)} not equal to len(A_list)={self.N}.")
+
+        for g in g_list:
+            if g.has_prox is not True:
+                raise ValueError(f"The functional g ({type(g)}) must have a prox method.")
+
+        #: Functionals to minimize; must have prox defined for each element.
+        self.g_list: List[Functional] = g_list
+
+        # if step_size_list is None:
+        #     step_size_list = [PGMStepSize() for _ in range(len(f_list))]
+        # self.step_size_list: List[PGMStepSize] = step_size_list
+        # self.step_size_list.internal_init(self)
+        self.L: float = L0  # reciprocal of step size (estimate of Lipschitz constant of ∇f)
+        self.fixed_point_residual = snp.inf
+
+        self.x_list: List[Union[Array, BlockArray]] = x0_list  # current estimate of solution
+        self.res = sum(self.A_list[i](self.x_list[i]) for i in range(self.N)) - self.y
+        self.res = jax.device_put(self.res, self.device)
+
+        self.device = device
+        for i in range(len(x0_list)):
+            self.x_list[i] = snp.array(jax.device_put(x0_list[i], self.device))
+
+        super().__init__(**kwargs)
+
+    def x_step(self, x_list: List[Union[Array, BlockArray]], res: Union[Array, BlockArray], L: float) -> List[Union[Array, BlockArray]]:
+        """Compute update for variable `x`."""
+        return ParallelPGM._x_step(self.A_list, self.g_list, x_list, res, L)
+
+    @staticmethod
+    @partial(jax.jit, static_argnums=(0, 1))
+    def _x_step(
+        A_list: List[Union[Loss, Functional]], g_list: List[Functional], x_list: List[Union[Array, BlockArray]], res: Union[Array, BlockArray], L: List[float]
+    ) -> List[Union[Array, BlockArray]]:
+        """Jit-able static method for computing update for variable `x`."""
+        return [g.prox(x - 1.0 / L * A.T(res), 1.0 / L) for A, g, x in zip(A_list, g_list, x_list)]
+
+    def _working_vars_finite(self) -> bool:
+        """Determine where ``NaN`` of ``Inf`` encountered in solve.
+
+        Return ``False`` if a ``NaN`` or ``Inf`` value is encountered in
+        a solver working variable.
+        """
+        return snp.all(snp.isfinite(self.x))
+
+    def _objective_evaluatable(self):
+        """Determine whether the objective function can be evaluated."""
+        return self.f.has_eval and self.g.has_eval
+
+    def _itstat_extra_fields(self):
+        """Define linearized ADMM-specific iteration statistics fields."""
+        itstat_fields = {"L": "%9.3e", "Residual": "%9.3e"}
+        itstat_attrib = ["L", "norm_residual()"]
+        return itstat_fields, itstat_attrib
+
+    def _state_variable_names(self) -> List[str]:
+        return ["x", "L"]
+
+    def minimizer(self) -> Union[Array, BlockArray]:
+        return self.x
+
+    def objective(self, x_list: Optional[List[Union[Array, BlockArray]]] = None) -> float:
+        r"""Evaluate the objective function :math:`f(\mb{x}) + g(\mb{x})`."""
+        if x_list is None:
+            x_list = self.x_list
+        return self.rho / 2 * snp.linalg.norm(sum(self.A_list[i](x_list[i]) for i in range(self.N)) - self.y) ** 2 + sum(g(x) for g, x in zip(self.g_list, x_list))
+
+    def f_quad_approx(
+        self, x: Union[Array, BlockArray], y: Union[Array, BlockArray], L: float
+    ) -> float:
+        r"""Evaluate the quadratic approximation to function :math:`f`.
+
+        Evaluate the quadratic approximation to function :math:`f`,
+        corresponding to :math:`\hat{f}_{L}(\mb{x}, \mb{y}) = f(\mb{y}) +
+        \nabla f(\mb{y})^H (\mb{x} - \mb{y}) + \frac{L}{2} \left\|\mb{x}
+        - \mb{y}\right\|_2^2`.
+        """
+        diff_xy = x - y
+        return (
+            self.f(y)
+            + snp.sum(snp.real(snp.conj(self.f.grad(y)) * diff_xy))
+            + 0.5 * L * snp.linalg.norm(diff_xy) ** 2
+        )
+
+    def norm_residual(self) -> float:
+        r"""Return the fixed point residual.
+
+        Return the fixed point residual (see Sec. 4.3 of
+        :cite:`liu-2018-first`).
+        """
+        return self.fixed_point_residual
+
+    def step(self):
+        """Take a single ParallelPGM step."""
+        # Update reciprocal of step size using current solution.
+        self.L = self.step_size.update(self.x)
+        x_list = self.x_step(self.x_list, self.res, self.L)
+        self.fixed_point_residual = snp.linalg.norm(self.x_list - x_list)
+        self.res = sum(self.A_list[i](x_list[i]) for i in range(self.N)) - self.y
+        self.x_list = x_list

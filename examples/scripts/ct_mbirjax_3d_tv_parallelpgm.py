@@ -26,11 +26,10 @@ import matplotlib.pyplot as plt
 
 
 '''
-Test for reconstruction for full 3D CT image with 
-naive way of dividing the image into blocks and reconstructing each block separately.
-Proximal Jacobi ADMM is used to reconstruct the full image, with the initial guess using a full ADMM solver.
+Test for reconstruction for full 3D CT image with naive way of dividing the image into blocks and reconstructing each block separately.
+Parallel PGM is used to reconstruct the full image, with the initial guess using a full ADMM solver.
 '''
-def pjadmm_test(
+def parallelpgm_test(
     Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2,
     rho=1e-3, tau=0.1, tv_weight=8e-3, n_projection=30, 
     maxiter_init=10, maxiter=1000
