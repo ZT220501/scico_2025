@@ -5,7 +5,7 @@
 # user license can be found in the 'LICENSE' file distributed with the
 # package.
 
-"""ADMM solver."""
+"""Parallel Proximal Jacobi ADMM solver."""
 
 # Needed to annotate a class method that returns the encapsulating class;
 # see https://www.python.org/dev/peps/pep-0563/
@@ -15,6 +15,7 @@ from typing import List, Optional, Tuple, Union, Callable
 import logging
 import os
 from datetime import datetime
+from functools import partial
 
 import scico.numpy as snp
 from scico.functional import Functional
@@ -25,6 +26,8 @@ from scico.optimize.admm import ADMM
 from scico import functional, linop, loss, metric, plot
 from scico.util import Timer
 import jax
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+import multiprocessing
 
 from ._admmaux import (
     FBlockCircularConvolveSolver,
@@ -37,10 +40,15 @@ from ._admmaux import (
 from ._common import Optimizer
 
 
-
-class ProxJacobiADMM(Optimizer):
+# TODO: Finish writing the actual multi-GPU version of proximal Jacobi ADMM.
+# Think more about where/how to store the sinogram acrossGPUs.
+class ParallelProxJacobiADMM(Optimizer):
     r"""Proximal Jacobi Alternating Direction Method of Multipliers (ADMM) algorithm.
     For reference, see https://link.springer.com/article/10.1007/s10915-016-0318-2.
+
+    This is a parallelized version of the ProxJacobiADMM algorithm using multiprocessing.
+    We assume that the block-wise PJADMM is executed on different GPUs, and for now
+    the sum_{i=1}^N A_ix_i and the dual variable λ are stored on the main CPU.
 
     TODO: Write the documentation more comprehensively.
 
@@ -56,16 +64,15 @@ class ProxJacobiADMM(Optimizer):
         tv_weight: float,
         λ: Optional[Array] = None,
         x0_list: Optional[List[Union[Array, BlockArray]]] = None,
-        cg_tol: float = 1e-4,
-        cg_maxiter: int = 25,
         display_period: int = 5,
-        device: str = "gpu",
         with_correction: bool = False,
         α: float = None,
         test_mode: bool = False,
         ground_truth: Optional[Array] = None,
         row_division_num: int = 4,
         col_division_num: int = 8,
+        device_list: List[str] = None,
+        num_processes: int = None,
         **kwargs,
     ):
         r"""Initialize an :class:`ProxJacobiADMM` object.
@@ -88,10 +95,27 @@ class ProxJacobiADMM(Optimizer):
             **kwargs: Additional optional parameters handled by
                 initializer of base class :class:`.Optimizer`.
         """
-        self.device = device
+
+        # Currently we only support the case that both the number of GPUs and the number of processes are provided.
+        if num_processes is None:
+            raise ValueError("num_processes is required.")
+        if device_list is None:
+            raise ValueError("device_list is required.")
+        self.num_processes = num_processes
+        self.device_list = device_list
+        # We need the process to be less than or equal to the number of GPUs.
+        if self.num_processes > len(self.device_list):
+            raise ValueError(f"num_processes={self.num_processes} is not equal to len(device_list)={len(self.device_list)}.")
+
         self.N = len(A_list)
         if len(g_list) != self.N:
             raise ValueError(f"len(g_list)={len(g_list)} not equal to len(A_list)={self.N}.")
+        if len(x0_list) != self.N:
+            raise ValueError(f"len(x0_list)={len(x0_list)} not equal to len(A_list)={self.N}.")
+        # Notice that the number of blocks must be less than or equal to the number of GPUs.
+        # If the multiple blocks are on the same GPU, they can just be merged into a single block!
+        if self.N > len(self.device_list):
+            raise ValueError(f"N={self.N} is greater than len(device_list)={len(self.device_list)}.")
         
         if not with_correction and α is not None:
             raise ValueError("alpha is only used when with_correction is True.")
@@ -107,27 +131,23 @@ class ProxJacobiADMM(Optimizer):
         self.test_mode: bool = test_mode
         self.ground_truth: Optional[Array] = ground_truth
 
-
         self.A_list: List[LinearOperator] = A_list      # List of partial forward sinogram projection operators typically.
         self.g_list: List[Functional] = g_list          # List of TV regularizers typically.
 
         self.ρ: float = ρ                               # ADMM penalty parameter.
-        self.y: Array = y                                # Ground truth full sinogram.
+        self.y_list: List[Array] = [jax.device_put(y, device) for device in self.device_list]  # Ground truth full sinogram on each of the GPUs.
         self.γ: float = γ                                # Damping parameter.
         self.τ: float = τ                                # Proximal weight.
         self.tv_weight: float = tv_weight                # TV weight.
         self.display_period: int = display_period        # Display period for the ADMM solver.
         self.with_correction: bool = with_correction    # Whether to use the correction term.
 
+        # Initialize the dual variable λ, and store it on the main CPU.
         if λ is None:
             self.λ = snp.zeros(A_list[0].output_shape, dtype=A_list[0].output_dtype)
         else:
             self.λ = λ
-        self.λ = jax.device_put(self.λ, self.device)
         self.λ_prev = self.λ.copy()
-
-        self.cg_tol: float = cg_tol
-        self.cg_maxiter: int = cg_maxiter
 
         if x0_list is None:
             input_shape = A_list[0].input_shape
@@ -135,19 +155,94 @@ class ProxJacobiADMM(Optimizer):
             self.x_list = [snp.zeros(input_shape, dtype=dtype) for _ in range(self.N)]
         else:
             self.x_list = x0_list
-        self.x_list = [snp.array(jax.device_put(x, self.device)) for x in self.x_list]
+        # Manually put the x_list elements on the corresponding GPUs.
+        self.x_list = [jax.device_put(x, device) for x, device in zip(self.x_list, self.device_list)]
+        for i, x in enumerate(self.x_list):
+            print(f"Device of x[{i}]: {x.device}")
+            print(f"Shape of x[{i}]: {x.shape}")
         self.x_list_prev = self.x_list.copy()
 
-        self.res = sum(self.A_list[i](self.x_list[i]) for i in range(self.N)) - self.y
-        self.res = jax.device_put(self.res, self.device)
+        # Initialize computed sinogram and residual on CPU
+        self.sinogram = sum(self.A_list[i](x0_list[i]) for i in range(self.N))
+        print("Device of sinogram: ", self.sinogram.device)
+        self.res = self.sinogram - self.y_list[0]
         self.res_prev = self.res.copy()
+        print("Device of res: ", self.res.device)
 
         self.row_division_num: int = row_division_num
         self.col_division_num: int = col_division_num
+        
 
         super().__init__(**kwargs)
 
+    # Parallel x-update step for x on different GPUs.
+    def x_update(self, worker_index: int):
+        print(f"Worker {worker_index} started")
+        print(f"Device of x[{worker_index}]: {self.x_list[worker_index].device}")
+        print(f"Device of sinogram: {self.sinogram.device}")
+        print(f"Device of y: {self.y_list[worker_index].device}")
+        print(f"Device of λ: {self.λ.device}")
 
+        # Move the sinogram to the corresponding GPU device.
+        sinogram_new = jax.device_put(self.sinogram, self.device_list[worker_index])
+        del self.sinogram
+        self.sinogram = sinogram_new
+        # Move the dual variable λ to the corresponding GPU device.
+        λ_new = jax.device_put(self.λ, self.device_list[worker_index])
+        del self.λ
+        self.λ = λ_new
+
+        # x-update step.
+        grad = self.ρ * self.A_list[worker_index].T(self.sinogram - self.y_list[worker_index] - self.λ / self.ρ)
+        self.x_list[worker_index] = self.g_list[worker_index].prox(self.x_list[worker_index] - 1 / self.τ * grad, self.tv_weight / self.τ)
+        print(f"Device of x[{worker_index}]: {self.x_list[worker_index].device}")
+
+
+    def sinogram_update(self):
+        """Update the sinogram, by summing over A_ix_i across all GPUs."""
+        del self.sinogram
+        self.sinogram = self.A_list[0](self.x_list[0])
+        for i in range(1, self.N):
+            sinogram_new = jax.device_put(self.sinogram, self.device_list[i])
+            del self.sinogram
+            sinogram_new += self.A_list[i](self.x_list[i])
+            self.sinogram = sinogram_new
+
+        sinogram_new = jax.device_put(self.sinogram, self.device_list[0])
+        del self.sinogram
+        self.sinogram = sinogram_new
+
+    def residual_update(self):
+        """Update the residual, by first updating the predicted sinogram, and then subtracting the ground truth sinogram."""
+        # Update the predicted sinogram.
+        self.sinogram_update()
+        self.res = self.sinogram - self.y_list[0]
+
+    def get_residual_on_device(self, device_index: int = 0):
+        """Get the residual value from a specific GPU device.
+        
+        Args:
+            device_index: Index of the device in device_list (default: 0)
+            
+        Returns:
+            Residual array on the specified device
+        """
+        if device_index >= len(self.device_list):
+            raise ValueError(f"device_index {device_index} out of range for {len(self.device_list)} devices")
+        return self.res_gpu_list[device_index]
+
+    def get_residual_sum_on_device(self, device_index: int = 0):
+        """Get the sum A_list[i](x_list[i]) for i in range(N) on a specific GPU device.
+        
+        Args:
+            device_index: Index of the device in device_list (default: 0)
+            
+        Returns:
+            Sum of A_list[i](x_list[i]) on the specified device
+        """
+        if device_index >= len(self.device_list):
+            raise ValueError(f"device_index {device_index} out of range for {len(self.device_list)} devices")
+        return self.res_gpu_list[device_index] + self.y
 
     def _working_vars_finite(self) -> bool:
         """Determine where ``NaN`` of ``Inf`` encountered in solve.
@@ -201,22 +296,15 @@ class ProxJacobiADMM(Optimizer):
         return metric.snr(self.ground_truth, tangle_recon)
 
     def constraint(self) -> float:
-        out = 0.0
-
-        Aix_list = []
-        for i, x_i in enumerate(self.x_list):
-            Aix = self.A_list[i](x_i)
-            # Aix = jax.device_put(Aix, self.device)
-            Aix_list.append(Aix)
-
-        out += self.ρ * snp.linalg.norm(sum(Aix_list) - self.y) ** 2 / 2
-
-        return out
+        self.sinogram_update()
+        return self.ρ * snp.linalg.norm(self.sinogram - self.y_list[0]) ** 2 / 2
 
     def tv(self) -> float:
         out = 0.0
         for i in range(self.N):
+            out = jax.device_put(out, self.device_list[i])
             out += self.tv_weight * self.g_list[i](self.x_list[i])
+        out = jax.device_put(out, self.device_list[0])
         return out
 
     def objective(self) -> float:
@@ -265,16 +353,8 @@ class ProxJacobiADMM(Optimizer):
         Returns:
             Norm of primal residual.
         """
-        if x_list is None:
-            x_list = self.x_list
-
-        Aix_list = []
-        for i, x_i in enumerate(x_list):
-            Aix = self.A_list[i](x_i)
-            Aix = jax.device_put(Aix, self.device)
-            Aix_list.append(Aix)
-        
-        residual = self.ρ * snp.linalg.norm(sum(Aix_list) - self.y) ** 2
+        self.sinogram_update()
+        residual = self.ρ * snp.linalg.norm(self.sinogram - self.y_list[0]) ** 2
         
         return snp.sqrt(residual)
 
@@ -316,30 +396,26 @@ class ProxJacobiADMM(Optimizer):
         self.x_list_prev = self.x_list.copy()
         self.res_prev = self.res.copy()
         self.λ_prev = self.λ.copy()
-
-        # x-update for all the subproblem blocks. 
-        # Each of the x-update is a proximal operator update.
-        Ax_k = sum(self.A_list[i](self.x_list[i]) for i in range(self.N))
-        for i in range(self.N):
-            grad = self.ρ * self.A_list[i].T(Ax_k - self.y - self.λ / self.ρ)
-            # Proximal operator update of the TV norm.
-            self.x_list[i] = self.g_list[i].prox(self.x_list[i] - 1 / self.τ * grad, self.tv_weight / self.τ)
-            # self.x_list[i] = snp.array(jax.device_put(self.x_list[i], self.device))
         
-        # Update the residual.
-        # Notice that this in fact can be done parallelly in practice, on self.N GPUs!
-        self.res = sum(self.A_list[i](self.x_list[i]) for i in range(self.N)) - self.y
-        # self.res = jax.device_put(self.res, self.device)
-
-        # Update dual variable λ
-        # Notice that in practice, only A_ix_i-y needs to be distributed, which has much smaller size than the full image.
-        # This part might be accelerated further.
+        # Multiprocessing version of x-update for all the subproblem blocks. 
+        # Each of the x-update is a proximal operator update.
+        processes = []
+        for i in range(self.N):
+            p = multiprocessing.Process(target=self.x_update, args=(i, ))
+            processes.append(p)
+            p.start()
+        for p in processes:
+            p.join()
+        # Update the residual \sum_{i=1}^N A_ix_i - y.
+        self.residual_update()
+        # Update dual variable λ using the already computed residual
+        # This avoids recomputing the sum since we already have it in self.res
         self.λ = self.λ - self.γ * self.ρ * self.res
 
+        # Here the with_correction
         if self.with_correction:
-            # Compute the correction step.
-            for i in range(self.N):
-                self.x_list[i] = self.x_list_prev[i] - self.α * (self.x_list_prev[i] - self.x_list[i])
+            # Compute the correction step using parallel execution.
+            self._parallel_correction_step()
             self.λ = self.λ_prev - self.α * (self.λ_prev - self.λ)
 
         # Compute 2/gamma*(lambda^k-lambda^{k+1})'*A(x^k-x^{k+1})
@@ -354,25 +430,21 @@ class ProxJacobiADMM(Optimizer):
         # Compute the lower bound of error decrease: h(u^k,u^{k+1})
         lower_bound = dx_norm + d_lambda_norm + cross_term
 
-        # For tau, set it to 1.05 operator norm might be able to work.
-        # if lower_bound < 0 and self.itnum < 100:
+        # if lower_bound < 0, double τ to ensure convergence:
         if lower_bound < 0:
             print("τ is doubled at iteration ", self.itnum)
             self.τ = self.τ * 2
 
-            # Revert back the variables as if the update never happened.
+            # Revert back the variables
             self.λ = self.λ + self.γ * self.ρ * self.res
             self.x_list = self.x_list_prev.copy()
             self.res = self.res_prev.copy()
-        # NOTE: Don't change this elif below. It's the default setting.
         elif self.itnum % 10 == 0:
             # Decrase τ after every a pre-defined number of iterations.
             self.τ = self.τ / 1.2
-            
 
-
-
-        
+        # Update the predicted sinogram \sum_{i=1}^N A_ix_i for proximal Jacobi ADMM update.
+        self.sinogram_update()
 
     def solve(
         self,

@@ -30,7 +30,6 @@ try:
 except ImportError:
     raise ImportError("Could not import mbirjax; please install it.")
 
-
 class XRayTransformParallel(LinearOperator):
     r"""Parallel beam X-ray transform based on mbirjax.
 

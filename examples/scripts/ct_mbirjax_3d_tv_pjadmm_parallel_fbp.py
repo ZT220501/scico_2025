@@ -13,7 +13,7 @@ from scico import functional, linop, loss, metric, plot
 from scico.examples import create_tangle_phantom, create_3d_foam_phantom
 from scico.linop.xray.mbirjax import XRayTransformParallel
 from scico.optimize.admm import ADMM, LinearSubproblemSolver
-from scico.optimize import ProxJacobiADMM
+from scico.optimize import ProxJacobiADMM, ParallelProxJacobiADMM
 from scico.util import device_info, create_roi_indices
 from scico.functional import IsotropicTVNorm, L1Norm
 
@@ -32,7 +32,7 @@ Proximal Jacobi ADMM is used to reconstruct the full image, with the initial gue
 '''
 def pjadmm_fbp_test(
     Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2,
-    rho=1e-3, tau=0.1, tv_weight=8e-3, n_projection=30, maxiter=1000
+    rho=1e-3, tau=0.1, tv_weight=1e-2, n_projection=30, maxiter=1000
 ):
     '''
     Create a ground truth image and projector.
@@ -46,7 +46,7 @@ def pjadmm_fbp_test(
         col_division_num: Number of column divisions number
     '''
     gpu_devices = jax.devices('gpu')
-    print(f"Using {gpu_devices[0]} GPU")
+    print("Number of GPUs: ", len(gpu_devices))
 
     # # Create a full 3D CT image phantom
     # tangle = snp.array(create_tangle_phantom(Nx, Ny, Nz))
@@ -134,7 +134,11 @@ def pjadmm_fbp_test(
     #     # Decrase τ after every a pre-defined number of iterations.
     #     self.τ = self.τ / 1.2
 
-    # The minimization parameter setting is as follows:
+    # The minimization parameter setting is as follows: for small size problems,
+    # ρ = 1e-3
+    # τ = 0.1
+    # tv_weight = 1e-2
+    # For large size problems,
     # ρ = 1e-4
     # τ = 0.1
     # tv_weight = 1e-2
@@ -154,26 +158,27 @@ def pjadmm_fbp_test(
 
     test_mode = True
 
-    tv_solver = ProxJacobiADMM(
+    tv_solver = ParallelProxJacobiADMM(
         A_list=A_list,
         g_list=g_list,
         ρ=ρ,
         y=y,
         τ=τ,
         γ=γ,
+        tv_weight = tv_weight,
         λ=λ,
         x0_list=x0_list,
         display_period = 1,
-        device = gpu_devices[0],
         with_correction = correction,
         α = α,
-        maxiter = maxiter,
-        itstat_options={"display": True, "period": 10},
-        ground_truth = tangle,
         test_mode = test_mode,
+        ground_truth = tangle,
         row_division_num = row_division_num,
         col_division_num = col_division_num,
-        tv_weight = tv_weight
+        device_list = gpu_devices,
+        num_processes = len(gpu_devices),
+        maxiter = maxiter,
+        itstat_options={"display": True, "period": 10}
     )
 
     """
@@ -259,8 +264,8 @@ if __name__ == "__main__":
                        help='Regularization parameter (default: 1e-3)')
     parser.add_argument('--tau', type=float, default=0.1,
                        help='Step size parameter (default: 0.1)')
-    parser.add_argument('--tv_weight', type=float, default=8e-3,
-                       help='TV regularization weight (default: 8e-3)')
+    parser.add_argument('--tv_weight', type=float, default=1e-2,
+                       help='TV regularization weight (default: 1e-2)')
     parser.add_argument('--n_projection', type=int, default=30,
                        help='Number of projections (default: 30)')
     parser.add_argument('--maxiter', type=int, default=1000,

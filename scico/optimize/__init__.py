@@ -20,6 +20,7 @@ from ._dadmm import DecentralizedADMM
 from ._pjadmm import ProxJacobiADMM
 from ._pjadmm_overlapped import ProxJacobiOverlappedADMM
 from ._pjadmm_v2 import ProxJacobiADMMv2
+from ._pjadmm_parallel import ParallelProxJacobiADMM
 
 __all__ = [
     "ADMM",
@@ -35,6 +36,7 @@ __all__ = [
     "ProxJacobiADMM",
     "ProxJacobiOverlappedADMM",
     "ProxJacobiADMMv2",
+    "ParallelProxJacobiADMM",
 ]
 
 # Imported items in __all__ appear to originate in top-level linop module
