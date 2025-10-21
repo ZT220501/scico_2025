@@ -30,9 +30,10 @@ Test for reconstruction for full 3D CT image with
 naive way of dividing the image into blocks and reconstructing each block separately.
 Proximal Jacobi ADMM is used to reconstruct the full image, with the initial guess using a full ADMM solver.
 '''
-def pjadmm_fbp_test(
+def pjadmm_parallel_fbp_test(
     Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2,
-    rho=1e-3, tau=0.1, tv_weight=1e-2, n_projection=30, maxiter=1000
+    rho=1e-3, tau=0.1, tv_weight=1e-2, n_projection=30, maxiter=1000,
+    N_sphere=100
 ):
     '''
     Create a ground truth image and projector.
@@ -49,9 +50,9 @@ def pjadmm_fbp_test(
     print("Number of GPUs: ", len(gpu_devices))
 
     # # Create a full 3D CT image phantom
-    # tangle = snp.array(create_tangle_phantom(Nx, Ny, Nz))
-    tangle = snp.array(create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=100))
-    tangle = snp.array(jax.device_put(tangle, gpu_devices[0]))
+    # x_gt = snp.array(create_tangle_phantom(Nx, Ny, Nz))
+    x_gt = snp.array(create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=N_sphere))
+    x_gt = snp.array(jax.device_put(x_gt, gpu_devices[0]))
 
     angles = np.linspace(0, np.pi, n_projection, endpoint=False)  # evenly spaced projection angles
     sinogram_shape = (Nz, n_projection, max(Nx, Ny))
@@ -63,7 +64,7 @@ def pjadmm_fbp_test(
         angles=angles,
         recon_shape=(Nx, Ny, Nz)
     )
-    y = A_full @ tangle
+    y = A_full @ x_gt
 
     initial_guess = A_full.fbp_recon(y)
 
@@ -172,7 +173,7 @@ def pjadmm_fbp_test(
         with_correction = correction,
         α = α,
         test_mode = test_mode,
-        ground_truth = tangle,
+        ground_truth = x_gt,
         row_division_num = row_division_num,
         col_division_num = col_division_num,
         device_list = gpu_devices,
@@ -185,22 +186,19 @@ def pjadmm_fbp_test(
     Run the TV regularized solver, block reconstruction.
     """
     print(f"Solving on {device_info()}\n")
-    tangle_recon_list = tv_solver.solve()
+    x_gt_recon_list = tv_solver.solve()
     
-
     '''
     Reconstruct the full image
     '''
-    Nz, Ny, Nx = tangle.shape
-    tangle_recon = snp.zeros(tangle.shape)
+    Nz, Ny, Nx = x_gt.shape
+    x_gt_recon = snp.zeros(x_gt.shape)
 
     for i in range(row_division_num):
         for j in range(col_division_num):
             roi_start_row, roi_end_row = i * Nx // row_division_num, (i + 1) * Nx // row_division_num  # Selected rows
             roi_start_col, roi_end_col = j * Ny // col_division_num, (j + 1) * Ny // col_division_num  # Selected columns
-            tangle_recon = tangle_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(tangle_recon_list[i * col_division_num + j])
-
-
+            x_gt_recon = x_gt_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(jax.device_put(x_gt_recon_list[i * col_division_num + j], gpu_devices[0]))
 
     """
     Show the recovered image.
@@ -208,7 +206,7 @@ def pjadmm_fbp_test(
     fig, ax = plot.subplots(nrows=1, ncols=2, figsize=(7, 6))
     test_slice = Nz // 2
     plot.imview(
-        tangle[test_slice],
+        x_gt[test_slice],
         title="Ground truth (central slice)",
         cmap=plot.cm.Blues,
         cbar=None,
@@ -216,9 +214,9 @@ def pjadmm_fbp_test(
         ax=ax[0],
     )
     plot.imview(
-        tangle_recon[test_slice],
+        x_gt_recon[test_slice],
         title="TV Reconstruction (central slice)\nSNR: %.2f (dB), MAE: %.3f"
-        % (metric.snr(tangle, tangle_recon), metric.mae(tangle, tangle_recon)),
+        % (metric.snr(x_gt, x_gt_recon), metric.mae(x_gt, x_gt_recon)),
         cmap=plot.cm.Blues,
         fig=fig,
         ax=ax[1],
@@ -229,16 +227,16 @@ def pjadmm_fbp_test(
     fig.show()
 
     # Save the figure
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_fbp_{row_division_num}_{col_division_num}')
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_parallel_tv_fbp_{row_division_num}_{col_division_num}_N_sphere{N_sphere}')
     os.makedirs(results_dir, exist_ok=True)
-    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
-    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_phantom_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
+    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
+    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_phantom_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
     fig.savefig(save_path)   # save the figure to file
 
 
-    print(f"Final SNR: {round(metric.snr(tangle, tangle_recon), 2)} (dB), Final MAE: {round(metric.mae(tangle, tangle_recon), 3)}")
+    print(f"Final SNR: {round(metric.snr(x_gt, x_gt_recon), 2)} (dB), Final MAE: {round(metric.mae(x_gt, x_gt_recon), 3)}")
 
-    return tangle_recon
+    return x_gt_recon
 
 
 
@@ -270,6 +268,8 @@ if __name__ == "__main__":
                        help='Number of projections (default: 30)')
     parser.add_argument('--maxiter', type=int, default=1000,
                        help='Number of iterations for block reconstruction (default: 1000)')
+    parser.add_argument('--N_sphere', type=int, default=100,
+                       help='Number of spheres in the foam phantom (default: 100)')
     # Parse arguments
     args = parser.parse_args()
     
@@ -299,7 +299,7 @@ if __name__ == "__main__":
     print("="*80)
     
 
-    test_results = pjadmm_fbp_test(
+    test_results = pjadmm_parallel_fbp_test(
         Nx=args.Nx,
         Ny=args.Ny,
         Nz=args.Nz,
@@ -309,6 +309,7 @@ if __name__ == "__main__":
         tau=args.tau,
         tv_weight=args.tv_weight,
         n_projection=args.n_projection,
-        maxiter=args.maxiter
+        maxiter=args.maxiter,
+        N_sphere=args.N_sphere
     )
     print("\n✅ Test completed!")

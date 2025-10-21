@@ -32,7 +32,8 @@ Proximal Jacobi ADMM is used to reconstruct the full image, with the initial gue
 '''
 def pjadmm_fbp_test(
     Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2,
-    rho=1e-3, tau=0.1, tv_weight=8e-3, n_projection=30, maxiter=1000
+    rho=1e-3, tau=0.1, tv_weight=8e-3, n_projection=30, maxiter=1000,
+    N_sphere=100
 ):
     '''
     Create a ground truth image and projector.
@@ -42,6 +43,7 @@ def pjadmm_fbp_test(
         Nx: Image width
         Ny: Image height  
         Nz: Image depth
+        N_sphere: Number of spheres in the foam phantom
         row_division_num: Number of row divisions number
         col_division_num: Number of column divisions number
     '''
@@ -50,7 +52,8 @@ def pjadmm_fbp_test(
 
     # # Create a full 3D CT image phantom
     # tangle = snp.array(create_tangle_phantom(Nx, Ny, Nz))
-    tangle = snp.array(create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=100))
+    print(f"Creating {N_sphere} spheres in the foam phantom...")
+    tangle = snp.array(create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=N_sphere))
     tangle = snp.array(jax.device_put(tangle, gpu_devices[0]))
 
     angles = np.linspace(0, np.pi, n_projection, endpoint=False)  # evenly spaced projection angles
@@ -224,10 +227,10 @@ def pjadmm_fbp_test(
     fig.show()
 
     # Save the figure
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_fbp_{row_division_num}_{col_division_num}')
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_fbp_{row_division_num}_{col_division_num}_N_sphere{N_sphere}')
     os.makedirs(results_dir, exist_ok=True)
-    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
-    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_phantom_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
+    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
+    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_phantom_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
     fig.savefig(save_path)   # save the figure to file
 
 
@@ -265,6 +268,8 @@ if __name__ == "__main__":
                        help='Number of projections (default: 30)')
     parser.add_argument('--maxiter', type=int, default=1000,
                        help='Number of iterations for block reconstruction (default: 1000)')
+    parser.add_argument('--N_sphere', type=int, default=100,
+                       help='Number of spheres in the foam phantom (default: 100)')
     # Parse arguments
     args = parser.parse_args()
     
@@ -304,6 +309,7 @@ if __name__ == "__main__":
         tau=args.tau,
         tv_weight=args.tv_weight,
         n_projection=args.n_projection,
-        maxiter=args.maxiter
+        maxiter=args.maxiter,
+        N_sphere=args.N_sphere
     )
     print("\n✅ Test completed!")
