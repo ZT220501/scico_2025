@@ -367,12 +367,7 @@ class ProxJacobiADMM(Optimizer):
         # NOTE: Don't change this elif below. It's the default setting.
         elif self.itnum % 10 == 0:
             # Decrase τ after every a pre-defined number of iterations.
-            self.τ = self.τ / 1.2
-            
-
-
-
-        
+            self.τ = self.τ / 1.2       
 
     def solve(
         self,

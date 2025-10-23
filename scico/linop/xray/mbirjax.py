@@ -13,6 +13,7 @@ X-ray transform :class:`.LinearOperator` wrapping the
 
 from typing import Optional, Tuple, Union, Any
 import numpy as np
+import jax.numpy as jnp
 from functools import partial
 import jax
 
@@ -59,7 +60,8 @@ class XRayTransformParallel(LinearOperator):
                 :class:`LinearOperator` is created.
         """
         # Convert angles to svmbir/mbirjax convention.
-        mbirjax_angles = 0.5 * snp.pi - angles
+        # mbirjax_angles = 0.5 * snp.pi - angles
+        mbirjax_angles = angles - 0.5 * snp.pi      # Fixed: This should be the correct conversion!
         # Convert the output shape to match the mbirjax convention.
         output_shape_mbirjax = (output_shape[1], output_shape[0], output_shape[2])
         self.model = mbirjax.ParallelBeamModel(output_shape_mbirjax, mbirjax_angles)
@@ -114,11 +116,18 @@ class XRayTransformParallel(LinearOperator):
         y = y.transpose(1, 0, 2)
         view_batch_size = len(self.model.get_params("angles"))
 
-        recon = self.model.fbp_recon(y, view_batch_size=view_batch_size, filter_name="ramp")
-        print(f"Recon shape: {recon.shape}")
+        filtered_sinogram = self.model.fbp_filter(y, filter_name="ramp", view_batch_size=view_batch_size)
+        filtered_sinogram = filtered_sinogram.transpose(1, 0, 2)        # Transpose to match the scico convention.
+        filtered_sinogram = jax.device_put(filtered_sinogram, jax.devices('cpu')[0])    # Put the filtered sinogram on the CPU to avoid memory constraints.
+        # By default, the filtered back projection is performed on the CPU instead of the GPU to avoid memory constraints.
+        # This will be served as the initial guess for the block proximal Jacobi ADMM solver.
+        recon = self._bproj(filtered_sinogram, self.indices, self.model.get_params("angles"), self.projector_params, coeff_power=1, device='cpu')
         # Transpose the recon from mbirjax convention to scico convention.
-        recon = recon.transpose(2, 1, 0)
-        return snp.array(recon)
+        with jax.default_device(jax.devices('cpu')[0]):
+            recon = recon.transpose(2, 1, 0)
+            result = snp.array(recon)
+
+        return result
 
     @staticmethod
     def _proj(
@@ -157,6 +166,7 @@ class XRayTransformParallel(LinearOperator):
         angles: snp.Array,
         projector_params: dict,
         coeff_power: int,
+        device: str = 'gpu',
     ) -> snp.Array:
         """
         Backward projection function for ROI reconstruction.
@@ -167,33 +177,53 @@ class XRayTransformParallel(LinearOperator):
             angles: Projection angles
             projector_params: Projector parameters
             coeff_power: Power for coefficient calculation
-            
+            device: Device to use for the reconstruction
+
         Returns:
             Reconstructed image with shape matching input_shape
         """
         # Get the ROI reconstruction shape from projector params
         input_shape = projector_params.recon_roi_shape
         input_shape = (input_shape[2], input_shape[1], input_shape[0])
-        recon = np.zeros((input_shape[0] * input_shape[1], input_shape[2]))
+        if device == 'cpu':
+            with jax.default_device(jax.devices('cpu')[0]):
+                recon = snp.zeros((input_shape[0] * input_shape[1], input_shape[2]))
+        else:
+            recon = snp.zeros((input_shape[0] * input_shape[1], input_shape[2]))
 
         # Generate the sinogram for each angle, with the desired pixel indices.
         # Stack all the views into a single sinogram.
-        for i in range(len(angles)):
-            recon_cylinder = mbirjax.ParallelBeamModel.back_project_one_view_to_pixel_batch(
-                sinogram[:, i, :],
-                pixel_indices,
-                angles[i],
-                projector_params,
-                coeff_power=coeff_power,
-            )
-            recon += recon_cylinder
+        if device == 'cpu':
+            with jax.default_device(jax.devices('cpu')[0]):
+                for i in range(len(angles)):
+                    recon_cylinder = XRayTransformParallel.back_project_one_view_to_pixel_batch(
+                        sinogram[:, i, :],
+                        pixel_indices,
+                        angles[i],
+                        projector_params,
+                        coeff_power=coeff_power,
+                    )
+                    recon += jax.device_put(recon_cylinder, jax.devices('cpu')[0])
+                # Transpose the reconstructed 3D image to match the scico convention.
+                recon = recon.reshape(input_shape)
+                recon = recon.transpose(2, 1, 0)
+                result = snp.array(recon)
+        else:
+            for i in range(len(angles)):
+                recon_cylinder = mbirjax.ParallelBeamModel.back_project_one_view_to_pixel_batch(
+                    sinogram[:, i, :],
+                    pixel_indices,
+                    angles[i],
+                    projector_params,
+                    coeff_power=coeff_power,
+                )
+                recon += recon_cylinder
+            # Transpose the reconstructed 3D image to match the scico convention.
+            recon = recon.reshape(input_shape)
+            recon = recon.transpose(2, 1, 0)
+            result = snp.array(recon)
 
-        # Transpose the reconstructed 3D image to match the scico convention.
-        recon = recon.reshape(input_shape)
-        recon = recon.transpose(2, 1, 0)
-        return snp.array(recon)
-
-
+        return result
 
     def get_params(self, parameter_names=None) -> Any:
         if parameter_names is None:
@@ -232,6 +262,57 @@ class XRayTransformParallel(LinearOperator):
         )
     
         return projector_params
+
+    # Copied from mbirjax/parallel_beam.py and modified to operate on the CPU by default.
+    @staticmethod
+    # @partial(jax.jit, static_argnames='projector_params')
+    def back_project_one_view_to_pixel_batch(sinogram_view, pixel_indices, angle, projector_params, coeff_power=1):
+        """
+        Apply parallel back projection to a single sinogram view and return the resulting voxel cylinders.
+
+        Args:
+            sinogram_view (2D jax array): one view of the sinogram to be back projected.
+                2D jax array of shape (num_det_rows)x(num_det_channels)
+            pixel_indices (1D jax array of int):  indices into flattened array of size num_rows x num_cols.
+            angle (float): The projection angle in radians for this view.
+            projector_params (namedtuple): tuple of (sinogram_shape, recon_shape, get_geometry_params()).
+            coeff_power (int): backproject using the coefficients of (A_ij ** coeff_power).
+                Normally 1, but should be 2 when computing Hessian diagonal.
+        Returns:
+            jax array of shape (len(pixel_indices), num_det_rows)
+        """
+        # Get all the geometry parameters - we use gp since geometry parameters is a named tuple and we'll access
+        # elements using, for example, gp.delta_det_channel, so a longer name would be clumsy.
+        gp = projector_params.geometry_params
+        num_views, num_det_rows, num_det_channels = projector_params.sinogram_shape
+
+        num_pixels = pixel_indices.shape[0]
+
+        # Get the data needed for horizontal projection, and put everything on the CPU.
+        n_p, n_p_center, W_p_c, cos_alpha_p_xy = mbirjax.ParallelBeamModel.compute_proj_data(pixel_indices, angle, projector_params)
+        n_p = jax.device_put(n_p, jax.devices('cpu')[0])
+        n_p_center = jax.device_put(n_p_center, jax.devices('cpu')[0])
+        W_p_c = jax.device_put(W_p_c, jax.devices('cpu')[0])
+        cos_alpha_p_xy = jax.device_put(cos_alpha_p_xy, jax.devices('cpu')[0])
+
+        L_max = jnp.minimum(1.0, W_p_c)
+        L_max = jax.device_put(L_max, jax.devices('cpu')[0])
+
+        with jax.default_device(jax.devices('cpu')[0]):
+            # Allocate the voxel cylinder array
+            det_voxel_cylinder = jnp.zeros((num_pixels, num_det_rows))
+            # jax.debug.breakpoint(num_frames=1)
+            # Do the horizontal projection
+            for n_offset in jnp.arange(start=-gp.psf_radius, stop=gp.psf_radius + 1):
+                n = n_p_center + n_offset
+                abs_delta_p_c_n = jnp.abs(n_p - n)
+                L_p_c_n = jnp.clip((W_p_c + 1.0) / 2.0 - abs_delta_p_c_n, 0.0, L_max)
+                A_chan_n = gp.delta_voxel * L_p_c_n / cos_alpha_p_xy
+                A_chan_n *= (n >= 0) * (n < num_det_channels)
+                A_chan_n = A_chan_n ** coeff_power
+                det_voxel_cylinder = jnp.add(det_voxel_cylinder, A_chan_n.reshape((-1, 1)) * sinogram_view[:, n].T)
+
+        return det_voxel_cylinder
 
 
 # TODO: Implement the scico wrapper of the cone beam X-ray transform, with block reconstruction.

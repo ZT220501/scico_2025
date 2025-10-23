@@ -169,7 +169,6 @@ class ParallelProxJacobiADMM(Optimizer):
 
         self.row_division_num: int = row_division_num
         self.col_division_num: int = col_division_num
-        
 
         super().__init__(**kwargs)
 
@@ -350,6 +349,7 @@ class ParallelProxJacobiADMM(Optimizer):
         
         return snp.sqrt(residual)
 
+    # TODO: Check if this is measured correctly.
     def norm_dual_residual(self) -> float:
         r"""Compute the :math:`\ell_2` norm of the dual residual.
 

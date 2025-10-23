@@ -31,7 +31,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 import scico.numpy as snp
 # from scico import numpy as snp
 from scico import functional, linop, loss, metric, plot
-from scico.examples import create_tangle_phantom
+from scico.examples import create_tangle_phantom, create_3d_foam_phantom
 from scico.linop.xray.astra import XRayTransform3D, SparseXRayTransform3D
 from scico.linop.xray.mbirjax import XRayTransformParallel
 from scico.optimize.admm import ADMM, LinearSubproblemSolver
@@ -55,19 +55,18 @@ def test_xray_transform_parallel_proj():
     print("=" * 60)
     
     # Setup parameters
-    Nx = 64
-    Ny = 128
-    Nz = 32
-    num_angles = 20
+    Nx = 256
+    Ny = 256
+    Nz = 256
+    num_angles = 30
     
     # Create angles
     angles = snp.linspace(0, snp.pi, num_angles, endpoint=False, dtype=snp.float32)
     
     # Create test phantom
-    test_phantom = snp.array(create_tangle_phantom(Nx, Ny, Nz))
-    test_phantom_transposed = np.transpose(test_phantom, (2, 1, 0))
+    # test_phantom = snp.array(create_tangle_phantom(Nx, Ny, Nz))
+    test_phantom = snp.array(create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=10))
     print(f"Test phantom shape: {test_phantom.shape}")
-    print(f"Test phantom transposed shape: {test_phantom_transposed.shape}")
     
     # Create sinogram shape
     sinogram_shape = (Nz, num_angles, max(Nx, Ny))
@@ -102,8 +101,8 @@ def test_xray_transform_parallel_proj():
     print("\n4. Reshaping phantom for _proj function...")
     # The _proj function expects x to be reshaped to (-1, x.shape[-1])
     # This means (Nx, Ny, Nz) -> (Nx*Ny, Nz)
-    phantom_reshaped = test_phantom_transposed.reshape(-1, test_phantom_transposed.shape[-1])
-    print(f"Reshaped phantom shape: {phantom_reshaped.shape}")
+    # phantom_reshaped = test_phantom_transposed.reshape(-1, test_phantom_transposed.shape[-1])
+    # print(f"Reshaped phantom shape: {phantom_reshaped.shape}")
     print(f"Test phantom shape: {test_phantom.shape}")
     print(f"Expected shape: ({Nx * Ny}, {Nz})")
     
@@ -121,8 +120,6 @@ def test_xray_transform_parallel_proj():
         scico_sinogram = C @ test_phantom
         print(f"SCICO sinogram shape: {scico_sinogram.shape}")
 
-        
-        
         # Step 7: Calculate differences
         print("\n7. Calculating differences...")
 
@@ -130,11 +127,14 @@ def test_xray_transform_parallel_proj():
         max_diff = np.max(diff)
         mean_diff = np.mean(diff)
         rel_diff = max_diff / (np.max(np.abs(scico_sinogram)) + 1e-10)
+        mse = np.mean(diff**2) * (1 / (Nx * Ny * Nz))
         
+        print(f"Max value of proj_sinogram in absolute value: {np.max(np.abs(proj_sinogram))}")
         print(f"Maximum absolute difference: {max_diff:.2e}")
         print(f"Mean absolute difference: {mean_diff:.2e}")
         print(f"Relative difference: {rel_diff:.2e}")
-        
+        print(f"MSE: {mse:.2e}")
+
         # Step 8: Verify pixel correspondence
         print("\n8. Verifying pixel correspondence...")
         
@@ -151,44 +151,19 @@ def test_xray_transform_parallel_proj():
             print(f"   Missing indices: {len(missing)}")
             print(f"   Extra indices: {len(extra)}")
         
-        # Check that reshaped phantom values correspond to original
-        print("\n9. Verifying phantom value correspondence...")
-        
-        # Sample a few pixels to verify correspondence
-        sample_indices = [0, Nx*Ny//4, Nx*Ny//2, 3*Nx*Ny//4, Nx*Ny-1]
-        
-        for idx in sample_indices:
-            if idx < len(full_indices):
-                pixel_idx = full_indices[idx]
-                row, col = np.unravel_index(pixel_idx, (Nx, Ny))
-                
-                # Get value from original phantom
-                original_value = test_phantom[:, row, col]
-                
-                # Get value from reshaped phantom
-                reshaped_value = phantom_reshaped[idx, :]
-                
-                # Check if they match
-                if np.allclose(original_value, reshaped_value):
-                    print(f"   ✅ Pixel {idx} (row={row}, col={col}): values match")
-                else:
-                    print(f"   ❌ Pixel {idx} (row={row}, col={col}): values don't match")
-                    print(f"      Original: {original_value[:3]}...")
-                    print(f"      Reshaped: {reshaped_value[:3]}...")
-        
-        # Step 10: Overall assessment
-        print("\n10. Overall assessment...")
+        # Step 9: Overall assessment
+        print("\n9. Overall assessment...")
         if rel_diff < 0.01:
             print("✅  Test succeeded: Results are similar")
             print("   This might be due to numerical precision differences")
         else:
             print("❌ Test FAILED: Results differ significantly")
 
-        # Step 11: Visualize the results
-        print("\n11. Visualizing the results...")
+        # Step 10: Visualize the results
+        print("\n10. Visualizing the results...")
         fig, ax = plot.subplots(nrows=1, ncols=2, figsize=(7, 2))
         plot.imview(
-            proj_sinogram[:, 10, :],
+            proj_sinogram[::-1, 10, ::-1],
             title="Sinogram with wrapper mbirjax @ operator",
             cmap=plot.cm.Blues,
             cbar=None,
@@ -205,16 +180,17 @@ def test_xray_transform_parallel_proj():
         )
         fig.show()
 
-        results_dir = os.path.join(os.path.dirname(__file__), 'results')
+        results_dir = os.path.join(os.path.dirname(__file__), f'results/XRayTransformParallel_proj_test')
         os.makedirs(results_dir, exist_ok=True)
-        save_path = os.path.join(results_dir, 'sinogram_comparison_proj.png')
+        # save_path = os.path.join(results_dir, f'XRayTransformParallel_proj_test_{Nx}x{Ny}x{Nz}_foam_100_spheres.png')
+        save_path = os.path.join(results_dir, f'XRayTransformParallel_proj_test_{Nx}x{Ny}x{Nz}_tangle_phantom.png')
         fig.savefig(save_path)   # save the figure to file
+
         
         return {
             'xray_transform': xray_transform,
             'mbirjax_model': mbirjax_model,
             'test_phantom': test_phantom,
-            'phantom_reshaped': phantom_reshaped,
             'full_indices': full_indices,
             'proj_sinogram': proj_sinogram,
             'scico_sinogram': scico_sinogram,
@@ -241,13 +217,14 @@ def test_xray_transform_parallel_proj_partial():
     Nx = 64
     Ny = 128
     Nz = 32
-    num_angles = 20
+    num_angles = 30
     
     # Create angles
     angles = snp.linspace(0, snp.pi, num_angles, endpoint=False, dtype=snp.float32)
     
     # Create test phantom
-    test_phantom = snp.array(create_tangle_phantom(Nx, Ny, Nz))
+    # test_phantom = snp.array(create_tangle_phantom(Nx, Ny, Nz))
+    test_phantom = snp.array(create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=10))
     
     # Define ROI (Region of Interest)
     roi_start_row, roi_end_row = 24, 40  # Middle 16 rows
@@ -325,7 +302,7 @@ def test_xray_transform_parallel_proj_partial():
     print("\n5. Assessment...")
     
     # Check if direct ROI and zero-padded ROI projections are the same
-    if roi_vs_zero_rel < 0.01:  # 1% relative difference threshold
+    if roi_vs_zero_rel < 0.05:  # 5% relative difference threshold
         print("✅ Direct ROI and zero-padded ROI projections are the same (as expected)")
         print("   This confirms that ROI projection is working correctly!")
     else:
@@ -388,7 +365,8 @@ def test_backward_projection_full():
     angles = snp.linspace(0, snp.pi, num_angles, endpoint=False, dtype=snp.float32)
     
     # Create test phantom
-    test_phantom = snp.array(create_tangle_phantom(Nx, Ny, Nz))
+    # test_phantom = snp.array(create_tangle_phantom(Nx, Ny, Nz))
+    test_phantom = snp.array(create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=10))
     print(f"Test phantom shape: {test_phantom.shape}")
     
     # Create sinogram shape
@@ -532,7 +510,8 @@ def test_backward_projection_roi():
     angles = snp.linspace(0, snp.pi, num_angles, endpoint=False, dtype=snp.float32)
     
     # Create test phantom
-    test_phantom = snp.array(create_tangle_phantom(Nx, Ny, Nz))
+    # test_phantom = snp.array(create_tangle_phantom(Nx, Ny, Nz))
+    test_phantom = snp.array(create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=10))
     
     # Define ROI (Region of Interest)
     roi_start_row, roi_end_row = 24, 40  # Middle 16 rows

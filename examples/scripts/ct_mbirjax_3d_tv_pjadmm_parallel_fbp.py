@@ -47,12 +47,10 @@ def pjadmm_parallel_fbp_test(
         col_division_num: Number of column divisions number
     '''
     gpu_devices = jax.devices('gpu')
-    print("Number of GPUs: ", len(gpu_devices))
 
     # # Create a full 3D CT image phantom
     # x_gt = snp.array(create_tangle_phantom(Nx, Ny, Nz))
-    x_gt = snp.array(create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=N_sphere))
-    x_gt = snp.array(jax.device_put(x_gt, gpu_devices[0]))
+    x_gt = create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=N_sphere, default_device='cpu')
 
     angles = np.linspace(0, np.pi, n_projection, endpoint=False)  # evenly spaced projection angles
     sinogram_shape = (Nz, n_projection, max(Nx, Ny))
@@ -64,10 +62,12 @@ def pjadmm_parallel_fbp_test(
         angles=angles,
         recon_shape=(Nx, Ny, Nz)
     )
+    print("Creating the full sinogram...")
     y = A_full @ x_gt
-
+    print("Doing the filtered back projection...")
+    # The filtered back projection is performed on the CPU to avoid memory constraints.
+    # Later in the ParallelProxJacobiADMM class instance, the initial guess will be put on the corresponding GPUs.
     initial_guess = A_full.fbp_recon(y)
-
     '''
     Set up problems and solvers for TV regularized solver, block reconstruction using proximal Jacobi ADMM.
     '''

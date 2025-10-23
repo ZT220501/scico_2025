@@ -67,7 +67,6 @@ def pjadmm_fbp_test(
         recon_shape=(Nx, Ny, Nz)
     )
     y = A_full @ tangle
-
     initial_guess = A_full.fbp_recon(y)
 
     '''
@@ -227,7 +226,7 @@ def pjadmm_fbp_test(
     fig.show()
 
     # Save the figure
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_fbp_{row_division_num}_{col_division_num}_N_sphere{N_sphere}')
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_tv_fbp_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_fixed_conversion')
     os.makedirs(results_dir, exist_ok=True)
     save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
     # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_phantom_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
