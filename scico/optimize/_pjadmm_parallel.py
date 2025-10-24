@@ -163,7 +163,17 @@ class ParallelProxJacobiADMM(Optimizer):
         self.x_list_prev = self.x_list.copy()
 
         # Initialize computed sinogram and residual on the first GPU.
-        self.sinogram = sum(self.A_list[i](x0_list[i]) for i in range(self.N))
+        # The sinogram will tranverse through all the GPUs, and the final result will be put on the first GPU.
+        self.sinogram = self.A_list[0](self.x_list[0])
+        for i in range(1, self.N):
+            sinogram_new = jax.device_put(self.sinogram, self.device_list[i])
+            del self.sinogram
+            sinogram_new += self.A_list[i](self.x_list[i])
+            self.sinogram = sinogram_new
+        sinogram_new = jax.device_put(self.sinogram, self.device_list[0])
+        del self.sinogram
+        self.sinogram = sinogram_new
+        
         self.res = self.sinogram - self.y_list[0]
         self.res_prev = self.res.copy()
 
