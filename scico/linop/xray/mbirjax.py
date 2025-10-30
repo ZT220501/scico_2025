@@ -122,12 +122,8 @@ class XRayTransformParallel(LinearOperator):
         # By default, the filtered back projection is performed on the CPU instead of the GPU to avoid memory constraints.
         # This will be served as the initial guess for the block proximal Jacobi ADMM solver.
         recon = self._bproj(filtered_sinogram, self.indices, self.model.get_params("angles"), self.projector_params, coeff_power=1, device='cpu')
-        # Transpose the recon from mbirjax convention to scico convention.
-        with jax.default_device(jax.devices('cpu')[0]):
-            recon = recon.transpose(2, 1, 0)
-            result = snp.array(recon)
 
-        return result
+        return recon
 
     @staticmethod
     def _proj(
@@ -265,7 +261,7 @@ class XRayTransformParallel(LinearOperator):
 
     # Copied from mbirjax/parallel_beam.py and modified to operate on the CPU by default.
     @staticmethod
-    # @partial(jax.jit, static_argnames='projector_params')
+    @partial(jax.jit, static_argnames='projector_params')
     def back_project_one_view_to_pixel_batch(sinogram_view, pixel_indices, angle, projector_params, coeff_power=1):
         """
         Apply parallel back projection to a single sinogram view and return the resulting voxel cylinders.

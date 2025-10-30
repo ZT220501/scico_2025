@@ -25,15 +25,65 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 
 
+def noisy_sinogram(sinogram, snr_db=30, use_variance=True, save_path=None):
+    """Add Poisson noise to the sinogram, so that SNR is around snr_db dB."""
+    # Set the seed for reproducibility.
+    seed = 42
+    np.random.seed(seed)
+
+    if use_variance:
+        P_signal = np.mean((sinogram - sinogram.mean())**2)
+    else:
+        P_signal = np.mean(sinogram**2)
+
+    sigma_n = np.sqrt(P_signal / (10**(snr_db/10.0)))
+    noise = np.random.normal(0.0, sigma_n, size=sinogram.shape).astype(np.float32)
+    sinogram_noisy = sinogram + noise
+    if save_path is not None:
+        save_recon_comparision(sinogram, sinogram_noisy, save_path)
+    return sinogram_noisy, noise
+
+
+def save_recon_comparision(x_gt, x_recon, save_path):
+    fig, ax = plot.subplots(nrows=1, ncols=2, figsize=(7, 6))
+    assert x_gt.shape == x_recon.shape
+    Nz = x_gt.shape[0]
+    test_slice = Nz // 2
+    plot.imview(
+        x_gt[test_slice],
+        title="Ground truth (central slice)",
+        cmap=plot.cm.Blues,
+        cbar=None,
+        fig=fig,
+        ax=ax[0],
+    )
+    plot.imview(
+        x_recon[test_slice],
+        title="FBP Reconstruction (central slice)\nSNR: %.2f (dB), MAE: %.3f"
+        % (metric.snr(x_gt, x_recon), metric.mae(x_gt, x_recon)),
+        cmap=plot.cm.Blues,
+        fig=fig,
+        ax=ax[1],
+    )
+    divider = make_axes_locatable(ax[1])
+    cax = divider.append_axes("right", size="5%", pad=0.2)
+    fig.colorbar(ax[1].get_images()[0], cax=cax, label="arbitrary units")
+    fig.show()
+
+    # Save the figure
+    fig.savefig(save_path)   # save the figure to file
+
+
+
 '''
 Test for reconstruction for full 3D CT image with 
 naive way of dividing the image into blocks and reconstructing each block separately.
 Proximal Jacobi ADMM is used to reconstruct the full image, with the initial guess using a full ADMM solver.
 '''
-def pjadmm_parallel_fbp_test(
+def pjadmm_parallel_fbp_noisy_test(
     Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2,
     rho=1e-3, tau=0.1, tv_weight=1e-2, n_projection=30, maxiter=1000,
-    N_sphere=100
+    N_sphere=100, sinogram_snr=30
 ):
     '''
     Create a ground truth image and projector.
@@ -64,43 +114,29 @@ def pjadmm_parallel_fbp_test(
     )
     print("Creating the full sinogram...")
     y = A_full @ x_gt
+    print("Creating the noisy sinogram...")
+    sinogram_snr = int(sinogram_snr)
+
+
+    plt.imshow(x_gt[Nz//2], cmap='gray')
+    plt.axis('off')
+    plt.savefig(os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", f"foam_sphere_{N_sphere}.png"), bbox_inches='tight', pad_inches=0)
+    plt.close()
+    exit()
+
+
+    y_noisy, noise = noisy_sinogram(y, snr_db=sinogram_snr, use_variance=True, save_path=os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "noisy_sinogram.png"))
     print("Doing the filtered back projection...")
     # The filtered back projection is performed on the CPU to avoid memory constraints.
     # Later in the ParallelProxJacobiADMM class instance, the initial guess will be put on the corresponding GPUs.
-    initial_guess = A_full.fbp_recon(y)
+    initial_guess = A_full.fbp_recon(y_noisy)
 
-
-
-    # fig, ax = plot.subplots(nrows=1, ncols=2, figsize=(7, 6))
-    # test_slice = Nz // 2
-    # plot.imview(
-    #     x_gt[test_slice],
-    #     title="Ground truth (central slice)",
-    #     cmap=plot.cm.Blues,
-    #     cbar=None,
-    #     fig=fig,
-    #     ax=ax[0],
-    # )
-    # plot.imview(
-    #     initial_guess[test_slice],
-    #     title="FBP Reconstruction (central slice)\nSNR: %.2f (dB), MAE: %.3f"
-    #     % (metric.snr(x_gt, initial_guess), metric.mae(x_gt, initial_guess)),
-    #     cmap=plot.cm.Blues,
-    #     fig=fig,
-    #     ax=ax[1],
-    # )
-    # divider = make_axes_locatable(ax[1])
-    # cax = divider.append_axes("right", size="5%", pad=0.2)
-    # fig.colorbar(ax[1].get_images()[0], cax=cax, label="arbitrary units")
-    # fig.show()
-
-    # # Save the figure
-    # results_dir = os.path.join(os.path.dirname(__file__), f'results')
-    # os.makedirs(results_dir, exist_ok=True)
-    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_initial_guess.png')
-    # # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_phantom_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
-    # fig.savefig(save_path)   # save the figure to file
-
+    # true_initial_guess = A_full.fbp_recon(y)
+    # print("Sinogram SNR: ", str(sinogram_snr), "dB")
+    # save_recon_comparision(x_gt, initial_guess, os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "noisy_initial_guess.png"))
+    # print(f"Initial guess SNR: {round(metric.snr(x_gt, initial_guess), 2)} (dB), Initial guess MAE: {round(metric.mae(x_gt, initial_guess), 3)}")
+    # print(f"True initial guess SNR: {round(metric.snr(x_gt, true_initial_guess), 2)} (dB), True initial guess MAE: {round(metric.mae(x_gt, true_initial_guess), 3)}")
+    # exit()
 
     '''
     Set up problems and solvers for TV regularized solver, block reconstruction using proximal Jacobi ADMM.
@@ -198,7 +234,7 @@ def pjadmm_parallel_fbp_test(
         A_list=A_list,
         g_list=g_list,
         ρ=ρ,
-        y=y,
+        y=y_noisy,          # Note we only have the noisy sinogram available instead of the full sinogram.
         τ=τ,
         γ=γ,
         tv_weight = tv_weight,
@@ -262,20 +298,17 @@ def pjadmm_parallel_fbp_test(
     fig.show()
 
     # Save the figure
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_parallel_tv_fbp_cpu_initial_{row_division_num}_{col_division_num}_N_sphere{N_sphere}')
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_parallel_tv_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}')
     os.makedirs(results_dir, exist_ok=True)
-    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
-    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_fbp_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_phantom_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
+    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
     fig.savefig(save_path)   # save the figure to file
 
-
     print(f"Final SNR: {round(metric.snr(x_gt, x_gt_recon), 2)} (dB), Final MAE: {round(metric.mae(x_gt, x_gt_recon), 3)}")
-
     return x_gt_recon
 
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":    
     # Set up argument parser
     parser = argparse.ArgumentParser(
         description="3D TV-Regularized Sparse-View CT Reconstruction with Proximal Jacobi Overlapped ADMM using MBIRJAX",
@@ -305,6 +338,8 @@ if __name__ == "__main__":
                        help='Number of iterations for block reconstruction (default: 1000)')
     parser.add_argument('--N_sphere', type=int, default=100,
                        help='Number of spheres in the foam phantom (default: 100)')
+    parser.add_argument('--sinogram_snr', type=float, default=30,
+                       help='SNR of the sinogram in dB (default: 30)')
     # Parse arguments
     args = parser.parse_args()
     
@@ -334,7 +369,7 @@ if __name__ == "__main__":
     print("="*80)
     
 
-    test_results = pjadmm_parallel_fbp_test(
+    test_results = pjadmm_parallel_fbp_noisy_test(
         Nx=args.Nx,
         Ny=args.Ny,
         Nz=args.Nz,
@@ -345,6 +380,7 @@ if __name__ == "__main__":
         tv_weight=args.tv_weight,
         n_projection=args.n_projection,
         maxiter=args.maxiter,
-        N_sphere=args.N_sphere
+        N_sphere=args.N_sphere,
+        sinogram_snr=args.sinogram_snr
     )
     print("\n✅ Test completed!")

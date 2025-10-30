@@ -466,33 +466,22 @@ def create_3d_foam_phantom(
         np.random.seed(1)
 
     # Get CPU device for placing arrays
-    cpu_device = jax.devices('cpu')[0]
+    device = jax.devices(default_device)[0]
     
     coord_list = [snp.linspace(0, 1, N) for N in im_shape]
-    if default_device == 'gpu':
+    with jax.default_device(device):
         x = snp.stack(snp.meshgrid(*coord_list, indexing="ij"), axis=-1)
-    else:
-        with jax.default_device(cpu_device):
-            x = snp.stack(snp.meshgrid(*coord_list, indexing="ij"), axis=-1)
 
-    centers = np.random.uniform(low=r_mean + pad, high=1 - r_mean - pad, size=(N_sphere, 3))
-    radii = r_std * np.random.randn(N_sphere) + r_mean
+        centers = np.random.uniform(low=r_mean + pad, high=1 - r_mean - pad, size=(N_sphere, 3))
+        radii = r_std * np.random.randn(N_sphere) + r_mean
 
-    if default_device == 'gpu':
         im = snp.zeros(im_shape) + c_lo
-    else:
-        with jax.default_device(cpu_device):
-            im = snp.zeros(im_shape) + c_lo
 
-    for c, r in zip(centers, radii):  # type: ignore
-        dist = snp.sum((x - c) ** 2, axis=-1)
-        if snp.mean(im[dist < r**2] - c_lo) < 0.01 * c_hi:
-            # equivalent to im[dist < r**2] = c_hi in numpy
-            if default_device == 'gpu':
+        for c, r in zip(centers, radii):  # type: ignore
+            dist = snp.sum((x - c) ** 2, axis=-1)
+            if snp.mean(im[dist < r**2] - c_lo) < 0.01 * c_hi:
+                # equivalent to im[dist < r**2] = c_hi in numpy
                 im = im.at[dist < r**2].set(c_hi)
-            else:
-                with jax.default_device(cpu_device):
-                    im = im.at[dist < r**2].set(c_hi)
 
     return im
 
