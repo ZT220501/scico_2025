@@ -195,7 +195,9 @@ class ParallelProxJacobiADMM(Optimizer):
 
         # x-update step.
         grad = self.ρ * self.A_list[worker_index].T(self.sinogram - self.y_list[worker_index] - self.λ / self.ρ)
+        print("Device of grad: ", grad.device)
         self.x_list[worker_index] = self.g_list[worker_index].prox(self.x_list[worker_index] - 1 / self.τ * grad, self.tv_weight / self.τ)
+        print("Device of self.x_list[worker_index]: ", self.x_list[worker_index].device)
 
     def sinogram_update(self):
         """Update the sinogram, by summing over A_ix_i across all GPUs."""

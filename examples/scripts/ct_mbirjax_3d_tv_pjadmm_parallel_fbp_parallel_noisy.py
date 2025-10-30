@@ -78,9 +78,10 @@ def save_recon_comparision(x_gt, x_recon, save_path):
 '''
 Test for reconstruction for full 3D CT image with 
 naive way of dividing the image into blocks and reconstructing each block separately.
-Proximal Jacobi ADMM is used to reconstruct the full image, with the initial guess using FBP on a single CPU.
+Proximal Jacobi ADMM is used to reconstruct the full image, with the initial guess 
+to be reconstructed using FBP on each of the GPUs.
 '''
-def pjadmm_parallel_fbp_noisy_test(
+def pjadmm_parallel_fbp_parallel_noisy_test(
     Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2,
     rho=1e-3, tau=0.1, tv_weight=1e-2, n_projection=30, maxiter=1000,
     N_sphere=100, sinogram_snr=30
@@ -116,17 +117,6 @@ def pjadmm_parallel_fbp_noisy_test(
     print("Creating the noisy sinogram...")
     sinogram_snr = int(sinogram_snr)
     y_noisy, noise = noisy_sinogram(y, snr_db=sinogram_snr, use_variance=True, save_path=os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "noisy_sinogram.png"))
-    print("Doing the filtered back projection...")
-    # The filtered back projection is performed on the CPU to avoid memory constraints.
-    # Later in the ParallelProxJacobiADMM class instance, the initial guess will be put on the corresponding GPUs.
-    initial_guess = A_full.fbp_recon(y_noisy)
-
-    # true_initial_guess = A_full.fbp_recon(y)
-    # print("Sinogram SNR: ", str(sinogram_snr), "dB")
-    # save_recon_comparision(x_gt, initial_guess, os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "noisy_initial_guess.png"))
-    # print(f"Initial guess SNR: {round(metric.snr(x_gt, initial_guess), 2)} (dB), Initial guess MAE: {round(metric.mae(x_gt, initial_guess), 3)}")
-    # print(f"True initial guess SNR: {round(metric.snr(x_gt, true_initial_guess), 2)} (dB), True initial guess MAE: {round(metric.mae(x_gt, true_initial_guess), 3)}")
-    # exit()
 
     '''
     Set up problems and solvers for TV regularized solver, block reconstruction using proximal Jacobi ADMM.
@@ -143,6 +133,7 @@ def pjadmm_parallel_fbp_noisy_test(
     col_end_indices = []
 
     print("Creating mbirjax projectors for each ROI...")
+    device_idx = 0
     for i in range(row_division_num):
         for j in range(col_division_num):
             roi_start_row, roi_end_row = i * Nx // row_division_num, (i + 1) * Nx // row_division_num  # Selected rows
@@ -166,12 +157,26 @@ def pjadmm_parallel_fbp_noisy_test(
             )
             # Append the mbirjax projector to the list
             A_list.append(A)
-
-            # Cut the initial guess into corresponding blocks.
-            x0_block = initial_guess[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row]
+            # Do the FBP on each of the GPUs by using the ROI FBP.
+            y_noisy = jax.device_put(y_noisy, gpu_devices[device_idx])
+            x0_block = A.fbp_recon(y_noisy, device="gpu")
+            device_idx += 1         # Update the GPU device index to put the block on.
             x0_list.append(x0_block)
-    # Delete the initial guess to free up memory.
-    del initial_guess
+
+    Nz, Ny, Nx = x_gt.shape
+    x0_recon = snp.zeros(x_gt.shape)
+    for i in range(len(x0_list)):
+        print("Device of x0_list[%d]: %s" % (i, x0_list[i].device))
+
+    for i in range(row_division_num):
+        for j in range(col_division_num):
+            roi_start_row, roi_end_row = i * Nx // row_division_num, (i + 1) * Nx // row_division_num  # Selected rows
+            roi_start_col, roi_end_col = j * Ny // col_division_num, (j + 1) * Ny // col_division_num  # Selected columns
+            x0_recon = x0_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(jax.device_put(x0_list[i * col_division_num + j], gpu_devices[0]))
+
+    save_recon_comparision(x_gt, x0_recon, os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "fbp_recon_parallel_noisy.png"))
+    exit()
+    
     # Define the TV regularizer for each ROI in the later block reconstruction.
     g_list = [IsotropicTVNorm(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]
 
@@ -359,7 +364,7 @@ if __name__ == "__main__":
     print("="*80)
     
 
-    test_results = pjadmm_parallel_fbp_noisy_test(
+    test_results = pjadmm_parallel_fbp_parallel_noisy_test(
         Nx=args.Nx,
         Ny=args.Ny,
         Nz=args.Nz,

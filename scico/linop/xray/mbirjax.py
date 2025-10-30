@@ -112,16 +112,22 @@ class XRayTransformParallel(LinearOperator):
     def back_project(self, y: snp.Array) -> snp.Array:
         return self._bproj(y, self.indices, self.model.get_params("angles"), self.projector_params, coeff_power=1)
 
-    def fbp_recon(self, y: snp.Array) -> snp.Array:
+    def fbp_recon(self, y: snp.Array, device: str = 'cpu') -> snp.Array:
+        # Convert the sinogram to the mbirjax convention.
+        y_device = y.device         # Store the device of the sinogram for GPU fbp reconstruction.
         y = y.transpose(1, 0, 2)
         view_batch_size = len(self.model.get_params("angles"))
-
+        # Create the filtered sinogram, in the mbirjax convention.
         filtered_sinogram = self.model.fbp_filter(y, filter_name="ramp", view_batch_size=view_batch_size)
         filtered_sinogram = filtered_sinogram.transpose(1, 0, 2)        # Transpose to match the scico convention.
-        filtered_sinogram = jax.device_put(filtered_sinogram, jax.devices('cpu')[0])    # Put the filtered sinogram on the CPU to avoid memory constraints.
         # By default, the filtered back projection is performed on the CPU instead of the GPU to avoid memory constraints.
         # This will be served as the initial guess for the block proximal Jacobi ADMM solver.
-        recon = self._bproj(filtered_sinogram, self.indices, self.model.get_params("angles"), self.projector_params, coeff_power=1, device='cpu')
+        if device == 'cpu':
+            filtered_sinogram = jax.device_put(filtered_sinogram, jax.devices('cpu')[0])    # Put the filtered sinogram on the CPU to avoid memory constraints.
+            recon = self._bproj(filtered_sinogram, self.indices, self.model.get_params("angles"), self.projector_params, coeff_power=1, device='cpu')
+        else:
+            filtered_sinogram = jax.device_put(filtered_sinogram, y_device)
+            recon = self._bproj(filtered_sinogram, self.indices, self.model.get_params("angles"), self.projector_params, coeff_power=1, device=device)
 
         return recon
 
