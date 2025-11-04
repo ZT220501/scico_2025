@@ -72,6 +72,7 @@ def save_recon_comparision(x_gt, x_recon, save_path):
 
     # Save the figure
     fig.savefig(save_path)   # save the figure to file
+    plt.close(fig)
 
 
 
@@ -292,6 +293,13 @@ def pjadmm_parallel_fbp_noisy_test(
     os.makedirs(results_dir, exist_ok=True)
     save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
     fig.savefig(save_path)   # save the figure to file
+    plt.close(fig)
+
+    # Save the raw reconstruction result.
+    plt.imshow(x_gt_recon[test_slice], cmap='gray')
+    plt.axis('off')
+    plt.savefig(os.path.join(results_dir, f"ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}_raw.png"), bbox_inches='tight', pad_inches=0)
+    plt.close()
 
     print(f"Final SNR: {round(metric.snr(x_gt, x_gt_recon), 2)} (dB), Final MAE: {round(metric.mae(x_gt, x_gt_recon), 3)}")
     return x_gt_recon

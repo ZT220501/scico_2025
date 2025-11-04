@@ -13,7 +13,7 @@ from scico import functional, linop, loss, metric, plot
 from scico.examples import create_tangle_phantom, create_3d_foam_phantom
 from scico.linop.xray.mbirjax import XRayTransformParallel
 from scico.optimize.admm import ADMM, LinearSubproblemSolver
-from scico.optimize import ProxJacobiADMM, ParallelProxJacobiADMM
+from scico.optimize import ProxJacobiADMM, ParallelProxJacobiADMM, ParallelProxJacobiADMMv2
 from scico.util import device_info, create_roi_indices
 from scico.functional import IsotropicTVNorm, L1Norm
 
@@ -158,24 +158,25 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
             # Append the mbirjax projector to the list
             A_list.append(A)
             # Do the FBP on each of the GPUs by using the ROI FBP.
+            print("FBP on GPU %d..." % device_idx)
             y_noisy = jax.device_put(y_noisy, gpu_devices[device_idx])
             x0_block = A.fbp_recon(y_noisy, device="gpu")
             device_idx += 1         # Update the GPU device index to put the block on.
             x0_list.append(x0_block)
 
-    Nz, Ny, Nx = x_gt.shape
-    x0_recon = snp.zeros(x_gt.shape)
-    for i in range(len(x0_list)):
-        print("Device of x0_list[%d]: %s" % (i, x0_list[i].device))
+    # Nz, Ny, Nx = x_gt.shape
+    # x0_recon = snp.zeros(x_gt.shape)
+    # for i in range(len(x0_list)):
+    #     print("Device of x0_list[%d]: %s" % (i, x0_list[i].device))
 
-    for i in range(row_division_num):
-        for j in range(col_division_num):
-            roi_start_row, roi_end_row = i * Nx // row_division_num, (i + 1) * Nx // row_division_num  # Selected rows
-            roi_start_col, roi_end_col = j * Ny // col_division_num, (j + 1) * Ny // col_division_num  # Selected columns
-            x0_recon = x0_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(jax.device_put(x0_list[i * col_division_num + j], gpu_devices[0]))
+    # for i in range(row_division_num):
+    #     for j in range(col_division_num):
+    #         roi_start_row, roi_end_row = i * Nx // row_division_num, (i + 1) * Nx // row_division_num  # Selected rows
+    #         roi_start_col, roi_end_col = j * Ny // col_division_num, (j + 1) * Ny // col_division_num  # Selected columns
+    #         x0_recon = x0_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(jax.device_put(x0_list[i * col_division_num + j], gpu_devices[0]))
 
-    save_recon_comparision(x_gt, x0_recon, os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "fbp_recon_parallel_noisy.png"))
-    exit()
+    # save_recon_comparision(x_gt, x0_recon, os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "fbp_recon_parallel_noisy.png"))
+    # exit()
     
     # Define the TV regularizer for each ROI in the later block reconstruction.
     g_list = [IsotropicTVNorm(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]
@@ -225,7 +226,7 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
 
     test_mode = True
 
-    tv_solver = ParallelProxJacobiADMM(
+    tv_solver = ParallelProxJacobiADMMv2(
         A_list=A_list,
         g_list=g_list,
         ρ=ρ,
@@ -293,7 +294,7 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     fig.show()
 
     # Save the figure
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_parallel_tv_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}')
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_parallel_tv_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_v2')
     os.makedirs(results_dir, exist_ok=True)
     save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
     fig.savefig(save_path)   # save the figure to file

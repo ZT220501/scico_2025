@@ -29,6 +29,15 @@ from scico.typing import Axes, DType, Shape
 from ._functional import Functional
 from ._norm import L1Norm, L21Norm
 
+def memory_stats(device_idx = 0):
+    device = jax.devices('gpu')[device_idx]
+    memory_stats = jax.devices()[device.id].memory_stats() if hasattr(device, 'memory_stats') else None
+    if memory_stats:
+        print(f"Device: {device}")
+        print(f"Total memory: {memory_stats.get('bytes_limit', 0) / 1024**3:.2f} GB")
+        print(f"Used memory: {memory_stats.get('bytes_in_use', 0) / 1024**3:.2f} GB")
+        print(f"Free memory: {(memory_stats.get('bytes_limit', 0) - memory_stats.get('bytes_in_use', 0)) / 1024**3:.2f} GB")
+
 
 class TVNorm(Functional):
     r"""Generic total variation (TV) norm.
@@ -158,6 +167,7 @@ class TVNorm(Functional):
             )
             # fused adjoint transform and crop linop
             CWT = C @ W.T
+            # print("CWT is ", CWT)
         return WP, CWT, ndims, slce
 
     @staticmethod
@@ -229,9 +239,12 @@ class TVNorm(Functional):
         assert self.prox_ndims is not None
         assert self.prox_slice is not None
         K = 2 * self.prox_ndims
+        # print("I'm in the prox method of TVNorm class.")
         u = TVNorm._prox_core(
             self.WP, self.CWT, self.norm, K, TVNorm._slice_tuple_to_tuple(self.prox_slice), v, lam
         )
+        # print("After prox core")
+        # memory_stats()
 
         return u
 
