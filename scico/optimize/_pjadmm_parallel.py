@@ -459,7 +459,6 @@ class ParallelProxJacobiADMM(Optimizer):
             # Decrase τ after every a pre-defined number of iterations.
             self.τ = self.τ / 1.2
 
-
     def solve(
         self,
         callback: Optional[Callable[[Optimizer], None]] = None,

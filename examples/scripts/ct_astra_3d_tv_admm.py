@@ -91,20 +91,21 @@ def save_recon_comparision(x_gt, x_recon, save_path):
 """
 Create a ground truth image and projector.
 """
-Nx = 512
+Nx = 512    
 Ny = 512
 Nz = 512
 
 # tangle = snp.array(create_tangle_phantom(Nx, Ny, Nz))
 tangle = create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=100, default_device='gpu')
 
-n_projection = 30  # number of projections
+n_projection = 100  # number of projections
 angles = np.linspace(0, np.pi, n_projection, endpoint=False)  # evenly spaced projection angles
 C = XRayTransform3D(
     tangle.shape, det_count=[Nz, max(Nx, Ny)], det_spacing=[1.0, 1.0], angles=angles
 )  # CT projection operator
 y = C @ tangle  # sinogram
-y_noisy, noise = noisy_sinogram(y, snr_db=40, use_variance=True, save_path=None)
+snr_db = int(40)
+y_noisy, noise = noisy_sinogram(y, snr_db=snr_db, use_variance=True, save_path=None)
 
 
 
@@ -117,13 +118,22 @@ maxiter = 100  # number of ADMM iterations
 cg_tol = 1e-4  # CG relative tolerance
 cg_maxiter = 25  # maximum CG iterations per ADMM iteration
 
+########################################################################
+# The original formulation.
 # The append=0 option makes the results of horizontal and vertical
 # finite differences the same shape, which is required for the L21Norm,
 # which is used so that g(Ax) corresponds to isotropic TV.
-D = linop.FiniteDifference(input_shape=tangle.shape, append=0)
-g = λ * functional.L21Norm()
+# D = linop.FiniteDifference(input_shape=tangle.shape, append=0)
+D = linop.Identity(input_shape=tangle.shape)
+# g = λ * functional.L21Norm()
+g = λ * functional.L1Norm()
 # f = loss.SquaredL2Loss(y=y, A=C)
 f = loss.SquaredL2Loss(y=y_noisy, A=C)
+########################################################################
+
+print("D is ", D)
+print("g is ", g)
+print("f is ", f)
 
 # FBP initial guess
 sinogram_shape = (Nz, n_projection, max(Nx, Ny))
@@ -134,12 +144,11 @@ A_full = XRayTransformParallel(
 )
 x0 = A_full.fbp_recon(y_noisy)
 
-save_recon_comparision(tangle, x0, "/home/zhengtan/repos/scico/examples/scripts/results/ct_astra_3d_tv_admm/ct_astra_3d_tv_admm_recon_fbp.png")
 
-
+# TODO: Do the ADMM formulation to be the same as the PJADMM solver.
 solver = ADMM(
-    f=f,
-    g_list=[g],
+    f=f,        # replace by the TV term
+    g_list=[g], # zero functional
     C_list=[D],
     rho_list=[ρ],
     x0=x0,
@@ -147,6 +156,17 @@ solver = ADMM(
     subproblem_solver=LinearSubproblemSolver(cg_kwargs={"tol": cg_tol, "maxiter": cg_maxiter}),
     itstat_options={"display": True, "period": 5},
 )
+
+# solver = ADMM(
+#     f=f,
+#     g_list=[g],
+#     C_list=[D],
+#     rho_list=[ρ],
+#     x0=x0,
+#     maxiter=maxiter,
+#     subproblem_solver=LinearSubproblemSolver(cg_kwargs={"tol": cg_tol, "maxiter": cg_maxiter}),
+#     itstat_options={"display": True, "period": 5},
+# )
 
 
 """
@@ -192,7 +212,7 @@ fig.show()
 # Save the figure
 results_dir = os.path.join(os.path.dirname(__file__), f'results/ct_astra_3d_tv_admm')
 os.makedirs(results_dir, exist_ok=True)
-save_path = os.path.join(results_dir, f'ct_astra_3d_tv_admm_recon_{n_projection}views_{Nx}x{Ny}x{Nz}.png')
+save_path = os.path.join(results_dir, f'ct_astra_3d_tv_admm_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_snr{snr_db}_maxiter{maxiter}_l1norm.png')
 fig.savefig(save_path)   # save the figure to file
 
 input("\nWaiting for input to close figures and exit")

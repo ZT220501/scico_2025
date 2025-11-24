@@ -60,14 +60,14 @@ def noisy_sinogram(sinogram, snr_db=30, use_variance=True, save_path=None):
 """
 Create a ground truth image and projector.
 """
-Nx = 64
-Ny = 64
-Nz = 64
+Nx = 512
+Ny = 512
+Nz = 512
 
 # tangle = snp.array(create_tangle_phantom(Nx, Ny, Nz))
 tangle = create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=100)
 
-n_projection = 10  # number of projections
+n_projection = 100  # number of projections
 angles = np.linspace(0, np.pi, n_projection, endpoint=False)  # evenly spaced projection angles
 det_spacing = [1.0, 1.0]
 det_count = [Nz, max(Nx, Ny)]
@@ -126,16 +126,13 @@ gradient sub-iterations used by the ADMM solver in the
 maxiter = 500  # number of ADMM iterations
 # maxiter = 1
 
-f = functional.ZeroFunctional()
-# g0 = loss.SquaredL2Loss(y=y)
-g0 = loss.SquaredL2Loss(y=y_noisy)
-# g1 = λ * functional.L21Norm()
-g1 = λ * functional.L1Norm()
-g = functional.SeparableFunctional((g0, g1))
-# D = linop.FiniteDifference(input_shape=tangle.shape, append=0)
+g = functional.ZeroFunctional()
+c = y_noisy
+f = λ * functional.L1Norm()
 D = linop.Identity(input_shape=tangle.shape)
+A = C
+B = linop.ScaledIdentity(input_shape=A.output_shape, scalar=0.0)      # Zero operator
 
-A = linop.VerticalStack((C, 𝛼 * D))
 
 # FBP initial guess
 sinogram_shape = (Nz, n_projection, max(Nx, Ny))
@@ -153,7 +150,8 @@ solver = ProximalADMM(
     f=f,
     g=g,
     A=A,
-    B=None,
+    B=B,
+    c=c,
     rho=ρ,
     mu=mu,
     nu=nu,
@@ -202,10 +200,9 @@ fig.colorbar(ax[1].get_images()[0], cax=cax, label="arbitrary units")
 fig.show()
 
 # Save the figure
-# results_dir = os.path.join(os.path.dirname(__file__), f'results/ct_astra_3d_tv_padmm')
-results_dir = os.path.join(os.path.dirname(__file__), f'results/ct_astra_3d_tv_padmm_fbp_initial')
+results_dir = os.path.join(os.path.dirname(__file__), f'results/ct_astra_3d_l1_basis_pursuit_padmm_fbp_initial')
 os.makedirs(results_dir, exist_ok=True)
-save_path = os.path.join(results_dir, f'ct_astra_3d_tv_padmm_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_snr{snr_db}_maxiter{maxiter}_l1norm.png')
+save_path = os.path.join(results_dir, f'ct_astra_3d_l1_basis_pursuit_padmm_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_snr{snr_db}_maxiter{maxiter}.png')
 fig.savefig(save_path)   # save the figure to file
 
 input("\nWaiting for input to close figures and exit")

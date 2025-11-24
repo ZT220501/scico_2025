@@ -1,7 +1,7 @@
 import numpy as np
 import jax
 import os
-
+import jax.numpy as jnp
 # Force GPU usage
 os.environ['JAX_PLATFORM_NAME'] = 'gpu'
 jax.config.update('jax_platform_name', 'gpu')
@@ -98,6 +98,7 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
         col_division_num: Number of column divisions number
     '''
     gpu_devices = jax.devices('gpu')
+    print("GPU devices: ", gpu_devices)
     # # Create a full 3D CT image phantom
     # x_gt = snp.array(create_tangle_phantom(Nx, Ny, Nz))
     x_gt = create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=N_sphere, default_device='gpu')
@@ -117,6 +118,7 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     print("Creating the noisy sinogram...")
     sinogram_snr = int(sinogram_snr)
     y_noisy, noise = noisy_sinogram(y, snr_db=sinogram_snr, use_variance=True, save_path=os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "noisy_sinogram.png"))
+
 
     '''
     Set up problems and solvers for TV regularized solver, block reconstruction using proximal Jacobi ADMM.
@@ -163,24 +165,22 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
             x0_block = A.fbp_recon(y_noisy, device="gpu")
             device_idx += 1         # Update the GPU device index to put the block on.
             x0_list.append(x0_block)
+    
+    # Define the TV regularizer for each ROI in the later block reconstruction.
+    g_list = [IsotropicTVNorm(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]       # ? can I just use prox or not?
+    # Possibility: prox approximation of the TV norm is really poor; choice of parameters is crucial.
+    # g_list = [L1Norm() for i in range(len(A_list))]         # Test for the L1 norm reconstruction results.
 
-    # Nz, Ny, Nx = x_gt.shape
-    # x0_recon = snp.zeros(x_gt.shape)
-    # for i in range(len(x0_list)):
-    #     print("Device of x0_list[%d]: %s" % (i, x0_list[i].device))
 
+    # x_fbp_recon = snp.zeros(x_gt.shape)
     # for i in range(row_division_num):
     #     for j in range(col_division_num):
     #         roi_start_row, roi_end_row = i * Nx // row_division_num, (i + 1) * Nx // row_division_num  # Selected rows
     #         roi_start_col, roi_end_col = j * Ny // col_division_num, (j + 1) * Ny // col_division_num  # Selected columns
-    #         x0_recon = x0_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(jax.device_put(x0_list[i * col_division_num + j], gpu_devices[0]))
+    #         x_fbp_recon = x_fbp_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(jax.device_put(x0_list[i * col_division_num + j], gpu_devices[0]))
 
-    # save_recon_comparision(x_gt, x0_recon, os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "fbp_recon_parallel_noisy.png"))
+    # save_recon_comparision(x_gt, x_fbp_recon, os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", f"noisy_sinogram_{n_projection}views.png"))
     # exit()
-    
-    # Define the TV regularizer for each ROI in the later block reconstruction.
-    g_list = [IsotropicTVNorm(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]
-
 
     ################################################################################################################
     # # This is the best setting for the problem of large size.
@@ -297,6 +297,7 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_parallel_tv_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_v2')
     os.makedirs(results_dir, exist_ok=True)
     save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
+    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_l1norm_pjadmm_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}_no_τ_change.png')
     fig.savefig(save_path)   # save the figure to file
 
     print(f"Final SNR: {round(metric.snr(x_gt, x_gt_recon), 2)} (dB), Final MAE: {round(metric.mae(x_gt, x_gt_recon), 3)}")
@@ -305,6 +306,7 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
 
 
 if __name__ == "__main__":    
+
     # Set up argument parser
     parser = argparse.ArgumentParser(
         description="3D TV-Regularized Sparse-View CT Reconstruction with Proximal Jacobi Overlapped ADMM using MBIRJAX",

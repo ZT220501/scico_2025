@@ -100,6 +100,7 @@ class ADMM(Optimizer):
         alpha: float = 1.0,
         x0: Optional[Union[Array, BlockArray]] = None,
         subproblem_solver: Optional[SubproblemSolver] = None,
+        solve_basis_pursuit: bool = False,
         **kwargs,
     ):
         r"""Initialize an :class:`ADMM` object.
@@ -144,6 +145,9 @@ class ADMM(Optimizer):
         self.x = x0
         self.z_list, self.z_list_old = self.z_init(self.x)
         self.u_list = self.u_init(self.x)
+
+        # For test purposes, we can use the basis pursuit solver.
+        self.solve_basis_pursuit: bool = solve_basis_pursuit
 
         super().__init__(**kwargs)
 
@@ -360,8 +364,13 @@ class ADMM(Optimizer):
             \mb{u}_i^{(k+1)} =  \mb{u}_i^{(k)} + C_i \mb{x}^{(k+1)} -
             \mb{z}^{(k+1)}_i \;.
         """
-
-        self.x = self.subproblem_solver.solve(self.x)
+        # For the test purposes, we solve the basis pursuit problem instead of the ADMM problem.
+        if self.solve_basis_pursuit:
+            v = self.z_list[0] - self.u_list[0]             # Assume for now only one z and one u.
+            self.x = self.f.prox(v, 1 / self.rho_list[0], v0=self.x)
+            self.x = v - Ay1
+        else:
+            self.x = self.subproblem_solver.solve(self.x)
 
         self.z_list_old = self.z_list.copy()
 

@@ -167,7 +167,6 @@ class TVNorm(Functional):
             )
             # fused adjoint transform and crop linop
             CWT = C @ W.T
-            # print("CWT is ", CWT)
         return WP, CWT, ndims, slce
 
     @staticmethod
@@ -239,12 +238,9 @@ class TVNorm(Functional):
         assert self.prox_ndims is not None
         assert self.prox_slice is not None
         K = 2 * self.prox_ndims
-        # print("I'm in the prox method of TVNorm class.")
         u = TVNorm._prox_core(
             self.WP, self.CWT, self.norm, K, TVNorm._slice_tuple_to_tuple(self.prox_slice), v, lam
         )
-        # print("After prox core")
-        # memory_stats()
 
         return u
 

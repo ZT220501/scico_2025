@@ -13,7 +13,7 @@ from scico import functional, linop, loss, metric, plot
 from scico.examples import create_tangle_phantom, create_3d_foam_phantom
 from scico.linop.xray.mbirjax import XRayTransformParallel
 from scico.optimize.admm import ADMM, LinearSubproblemSolver
-from scico.optimize import ProxJacobiADMM, ParallelProxJacobiADMM
+from scico.optimize import ProxJacobiADMM, ParallelProxJacobiADMM, ParallelProxJacobiADMMv2
 from scico.util import device_info, create_roi_indices
 from scico.functional import IsotropicTVNorm, L1Norm
 
@@ -24,10 +24,11 @@ from datetime import datetime
 
 import matplotlib.pyplot as plt
 import tifffile as tiff
+from scipy.ndimage import zoom
 
-
-
-def preprocess_nanolaminography_image(img_path="/home/zhengtan/datasets/TIFF_delta_regularized_ram-lak_freqscl_1.00"):
+# This funtion loads the full 3D image from the TIFF files from the original paper.
+# The image size is (768, 3840, 3840), which is of the full size of the image.
+def load_nanolaminography_image_from_tiff(img_path="/home/zhengtan/datasets/TIFF_delta_regularized_ram-lak_freqscl_1.00"):
     """Load the full 3D image from the TIFF files."""
     # The id runs from 0001 to 0768 to form a 3D image with shape (3840, 3840, 768)
     full_img = []
@@ -39,12 +40,30 @@ def preprocess_nanolaminography_image(img_path="/home/zhengtan/datasets/TIFF_del
 
     return full_img
 
-def save_recon_comparision(x_gt, x_recon, save_path):
+# This function downsamples the image by a factor of downsampling_factor in the frontal dimensions.
+# The expected shape of the original image is (768, 3840, 3840)
+# The expected shape of the downsampled image is (768, 1920, 1920) if downsampling_factor is 2.
+def image_downsampling(img, downsampling_factor=2):
+    """Downsample the image by a factor of downsampling_factor in the frontal dimensions."""
+    return zoom(img, (1, 1/downsampling_factor, 1/downsampling_factor), order=1)
+
+# This function loads the saved images from the PNG files, which are the saved images in the scico repo.
+# The image size is (768, 1920, 1920) if downsampled or (3840, 3840, 768) which is the full size image.
+def load_saved_nanolaminography_image(downsample=True):
+    """Load the saved downsampled image from the PNG files."""
+    if downsample:
+        img_path = "/home/zhengtan/repos/scico/examples/scripts/results/nanolaminography_ground_truth_downsampled"
+        return snp.load(os.path.join(img_path, 'tomo_volume_downsampled.npy'))
+    else:
+        img_path = "/home/zhengtan/repos/scico/examples/scripts/results/nanolaminography_ground_truth"
+        return snp.load(os.path.join(img_path, 'tomo_volume.npy'))
+
+def save_recon_comparision(x_gt, x_recon, save_path, test_slice=None):
     fig, ax = plot.subplots(nrows=1, ncols=2, figsize=(7, 6))
     assert x_gt.shape == x_recon.shape
     Nz = x_gt.shape[0]
-    # test_slice = Nz // 2
-    test_slice = 439
+    if test_slice is None:
+        test_slice = Nz // 2
     plot.imview(
         x_gt[test_slice],
         title="Ground truth (central slice)",
@@ -73,14 +92,13 @@ def save_recon_comparision(x_gt, x_recon, save_path):
 def pjadmm_parallel_fbp_nanolaminography_test(
     Nx=3840, Ny=3840, Nz=768, row_division_num=2, col_division_num=2, 
     rho=1e-4, tau=0.1, tv_weight=1e-2, n_projection=30, maxiter=1000,
-    img_path="/home/zhengtan/datasets/TIFF_delta_regularized_ram-lak_freqscl_1.00",
-    save_initial_guess=True):
-
+    downsample=True):
+    # Get the GPU devices used.
     gpu_devices = jax.devices('gpu')
-
-    # Load the full image, with shape (768, 3840, 3840)
-    print("Loading the full image...")
-    x_gt = preprocess_nanolaminography_image(img_path=img_path)
+    # Load the saved ground truth image, with or without downsampling.
+    print("Loading the ground truth image...")
+    x_gt = load_saved_nanolaminography_image(downsample=downsample)
+    x_gt = x_gt.astype(snp.float32)     # Convert to float32 to avoid overflow when plotting uint16 images
 
     # Create the projector and the full sinogram
     angles = np.linspace(0, np.pi, n_projection, endpoint=False)  # evenly spaced projection angles
@@ -142,20 +160,6 @@ def pjadmm_parallel_fbp_nanolaminography_test(
     # Define the TV regularizer for each ROI in the later block reconstruction.
     g_list = [IsotropicTVNorm(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]
 
-    # # Reconstruct the full image of the initial guess.
-    # Nz, Ny, Nx = x_gt.shape
-    # with jax.default_device(jax.devices('cpu')[0]):
-    #     x0_recon = snp.zeros(x_gt.shape)
-
-    # for i in range(row_division_num):
-    #     for j in range(col_division_num):
-    #         roi_start_row, roi_end_row = i * Nx // row_division_num, (i + 1) * Nx // row_division_num  # Selected rows
-    #         roi_start_col, roi_end_col = j * Ny // col_division_num, (j + 1) * Ny // col_division_num  # Selected columns
-    #         x0_recon = x0_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(jax.device_put(x0_list[i * col_division_num + j], jax.devices('cpu')[0]))
-
-    # save_recon_comparision(x_gt, x0_recon, os.path.join(os.path.dirname(__file__), f'results/ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_nanolaminography_initial_guess.png'))
-    # exit()
-
     '''
     Reconstruction using the proximal Jacobi ADMM solver.
     '''
@@ -171,7 +175,7 @@ def pjadmm_parallel_fbp_nanolaminography_test(
     print(f"ρ: {ρ}, τ: {τ}, regularization: {tv_weight}, γ: {γ}, correction: {correction}, α: {α}, maxiter: {maxiter}")
 
     test_mode = True
-    tv_solver = ParallelProxJacobiADMM(
+    tv_solver = ParallelProxJacobiADMMv2(
         A_list=A_list,
         g_list=g_list,
         ρ=ρ,
@@ -202,39 +206,62 @@ def pjadmm_parallel_fbp_nanolaminography_test(
     '''
     Nz, Ny, Nx = x_gt.shape
     x_recon = snp.zeros(x_gt.shape)
-
+    # Use slice 439 for visual quality testing, which is a representative slice with fine details.
+    test_slices = [359, 439, 529, 639]
     for i in range(row_division_num):
         for j in range(col_division_num):
             roi_start_row, roi_end_row = i * Nx // row_division_num, (i + 1) * Nx // row_division_num  # Selected rows
             roi_start_col, roi_end_col = j * Ny // col_division_num, (j + 1) * Ny // col_division_num  # Selected columns
             x_recon = x_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(jax.device_put(x_recon_list[i * col_division_num + j], gpu_devices[0]))
 
-    save_recon_comparision(x_gt, x_recon, os.path.join(os.path.dirname(__file__), f'results/ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_nanolaminography.png'))
-    # Save the raw reconstruction result.
-    results_dir = os.path.join(os.path.dirname(__file__), f'results')
-    os.makedirs(results_dir, exist_ok=True)
-    plt.imshow(x_recon[test_slice], cmap='gray')
-    plt.axis('off')
-    plt.savefig(os.path.join(results_dir, f"ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_nanolaminography_raw.png"), bbox_inches='tight', pad_inches=0)
-    plt.close()
+    # Save the reconstruction results.
+    print("Saving the reconstruction results...")
+    if downsample:
+        results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_parallel_fbp_nanolaminography_downsampled')
+    else:
+        results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_parallel_fbp_nanolaminography')
+    # for test_slice in test_slices:
+    for test_slice in range(1, Nz+1):
+        slice_dir = os.path.join(results_dir, f'slice{test_slice}')
+        os.makedirs(slice_dir, exist_ok=True)
+        # Save the reconstruction comparison figure.
+        save_recon_comparision(x_gt, x_recon, os.path.join(slice_dir, f'ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_nanolaminography_{n_projection}views_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_maxiter{maxiter}.png'), test_slice=test_slice)
+        # Save the raw reconstruction result.
+        plt.imshow(x_recon[test_slice], cmap='gray')
+        plt.axis('off')
+        plt.savefig(os.path.join(slice_dir, f"ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_nanolaminography_{n_projection}views_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_maxiter{maxiter}_raw.png"), bbox_inches='tight', pad_inches=0)
+        plt.close()
+    # Save the raw full reconstruction result so that it can be examined for various metrics in the future.
+    snp.save(os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_nanolaminography_{n_projection}views_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_maxiter{maxiter}.npy'), x_recon)
 
+    print(f"Final SNR: {round(metric.snr(x_gt, x_recon), 2)} (dB), Final MAE: {round(metric.mae(x_gt, x_recon), 3)}")
     return x_recon
     
 
 
 if __name__ == "__main__":
-
     # img_path = "/home/zhengtan/datasets/TIFF_delta_regularized_ram-lak_freqscl_1.00"
     # save_path = "/home/zhengtan/repos/scico/examples/scripts/results/nanolaminography_ground_truth"
-    # os.makedirs(save_path, exist_ok=True)
-
+    # # Load the full image, with shape (768, 3840, 3840)
+    # print("Loading the full image...")
+    # x_gt = load_nanolaminography_image_from_tiff(img_path=img_path)
+    # snp.save(os.path.join(save_path, 'tomo_volume.npy'), x_gt)
+    # exit()
+    # # Save the downsampled image
+    # print("Downsampling the image...")
+    # x_gt_downsampled = image_downsampling(x_gt)
+    # print("Shape of the downsampled image: ", x_gt_downsampled.shape)
+    # save_path = "/home/zhengtan/repos/scico/examples/scripts/results/nanolaminography_ground_truth_downsampled"
+    # snp.save(os.path.join(save_path, 'tomo_volume_downsampled.npy'), x_gt_downsampled)
+    # exit()
+    # os.makedirs(save_path, exist_ok=True)    
     # for i in range(1, 769):
     #     if i % 50 == 0:
     #         print(f"Processing slice {i}...")
-    #     img_slice = tiff.imread(os.path.join(img_path, f"tomo_delta_S00974_to_S03875_ram-lak_freqscl_1.00_{i:04d}.tif"))
+    #     img_slice = x_gt_downsampled[i-1]
     #     plt.imshow(img_slice, cmap='gray')
     #     plt.axis('off')
-    #     plt.savefig(os.path.join(save_path, f"tomo_delta_S00974_to_S03875_ram-lak_freqscl_1.00_{i:04d}.png"), bbox_inches='tight', pad_inches=0)
+    #     plt.savefig(os.path.join(save_path, f"tomo_delta_S00974_to_S03875_ram-lak_freqscl_1.00_downsampled_{i:04d}.png"), bbox_inches='tight', pad_inches=0)
     #     plt.close()
 
     # Set up argument parser
@@ -264,6 +291,8 @@ if __name__ == "__main__":
                        help='Number of projections (default: 30)')
     parser.add_argument('--maxiter', type=int, default=1000,
                        help='Number of iterations for block reconstruction (default: 1000)')
+    parser.add_argument('--downsample', type=bool, default=True,
+                       help='Whether to downsample the image (default: True)')
 
     # Parse arguments
     args = parser.parse_args()
@@ -305,5 +334,6 @@ if __name__ == "__main__":
         tv_weight=args.tv_weight,
         n_projection=args.n_projection,
         maxiter=args.maxiter,
+        downsample=args.downsample,
     )
     print("\n✅ Test completed!")

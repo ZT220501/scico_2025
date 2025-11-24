@@ -178,6 +178,14 @@ class ParallelProxJacobiADMMv2(Optimizer):
         self.row_division_num: int = row_division_num
         self.col_division_num: int = col_division_num
 
+        # Auxiliary functions for the parallelization of the Ax update.
+        def _make_A_apply_fn(A_i):
+            @jax.jit
+            def A_apply_single(x_i):
+                return A_i(x_i)
+            return A_apply_single
+        self._A_apply_fns = [_make_A_apply_fn(Ai) for Ai in self.A_list]
+
         super().__init__(**kwargs)
 
     # Parallel x-update step for x on different GPUs.
@@ -185,18 +193,23 @@ class ParallelProxJacobiADMMv2(Optimizer):
         # x-update step.
         grad = self.ρ * self.A_list[worker_index].T(self.Ax_list[worker_index] - self.y_list[worker_index] - self.λ_list[worker_index] / self.ρ)
         self.x_list[worker_index] = self.g_list[worker_index].prox(self.x_list[worker_index] - 1 / self.τ * grad, self.tv_weight / self.τ)
-
+            
+    # Parallel Ax update step for Ax on different GPUs.
     def Ax_update(self):
-        """Update the sinogram, by summing over A_ix_i across all GPUs."""
-        # Parallelly compute A_ix_i for all the blocks on each of the GPUs.
-        # TODO: This doesn't really seem to be parallelized; even multi-threading won't help much.
-        # How to parallelize this?
-        Ax_list = [self.A_list[i](self.x_list[i]) for i in range(self.N)]
+        """Update the predicted sinogram, by summing over A_ix_i across all GPUs."""
+        # Launch A_i(x_i) on each GPU using JIT compilation.
+        # After the first time compilation, the Ax_list update are fully parallelized.
+        Ax_list = [None] * self.N
+        for i in range(self.N):
+            Ax_list[i] = self._A_apply_fns[i](self.x_list[i])
+        for Ax in Ax_list:
+            Ax.block_until_ready()
         # Convert the Ax_list to a sharded array in order to use jax.lax.psum.
         Ax_list = jax.device_put_sharded(Ax_list, self.device_list)
         # Use jax.lax.psum to simultaneously update all the Ax on each of the GPUs.
         self.Ax_list = jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(Ax_list)
 
+    # Parallel residual update step for residual on the first GPU.
     def residual_update(self):
         """Update the residual, by first updating the predicted sinogram, and then subtracting the ground truth sinogram."""
         # Update the global variable Ax = \sum_{i=1}^N A_ix_i.
@@ -383,23 +396,25 @@ class ParallelProxJacobiADMMv2(Optimizer):
         self.res_prev = self.res.copy()
         self.λ_prev_list = self.λ_list.copy()
 
-        # NOTE: DEPRECATED: This Ax_update step is not necessary, as the Ax_update is handled in the later residual_update() step.
-        # # Update the predicted sinogram \sum_{i=1}^N A_ix_i for proximal Jacobi ADMM update.
-        # self.Ax_update()
+        # Update the predicted sinogram \sum_{i=1}^N A_ix_i for proximal Jacobi ADMM update.
+        self.Ax_update()
 
-        # Multithreading version of x-update for all the subproblem blocks. 
-        # Parallelization of the x-update step across different GPUs is achieved.
-        # Notice that in this case, multi-threading is much faster than vanilla for loop JAX asynchronous dispatch.
-        threads = []
+        # # Multithreading version of x-update for all the subproblem blocks. 
+        # # Parallelization of the x-update step across different GPUs is achieved.
+        # # Notice that if we want to JIT the x-update step, much more memory is required.
+        # threads = []
+        # for i in range(self.N):
+        #     t = threading.Thread(target=self.x_update, args=(i,))
+        #     t.start()
+        #     threads.append(t)
+        # for t in threads:
+        #     t.join()
         for i in range(self.N):
-            t = threading.Thread(target=self.x_update, args=(i,))
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
+            self.x_update(i)
+        for i in range(self.N):
+            self.x_list[i].block_until_ready()  # wait for all to finish
         
         # Update the residual \sum_{i=1}^N A_ix_i - y.
-        # NOTE: Here the \sum_{i=1}^N A_ix_i is automatically updated, and can be used for the next iteration.
         self.residual_update()
 
         # Update dual variable λ
@@ -443,10 +458,12 @@ class ParallelProxJacobiADMMv2(Optimizer):
             self.λ_list = update_lambda_back(self.λ_list, res_replicated)
             self.x_list = self.x_list_prev.copy()
             self.res = self.res_prev.copy()
+        # elif self.itnum % 100 == 0:
+        #     # Decrase τ after every a pre-defined number of iterations.
+        #     self.τ = self.τ * 1.2
         elif self.itnum % 10 == 0:
             # Decrase τ after every a pre-defined number of iterations.
             self.τ = self.τ / 1.2
-
 
     def solve(
         self,
