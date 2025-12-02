@@ -82,7 +82,7 @@ print("shape of tangle is: ", tangle.shape)
 print("shape of C is: ", C.shape)
 
 y = C @ tangle  # sinogram
-snr_db = int(40)
+snr_db = int(30)
 print(f"SNR of sinogram: {snr_db} dB")
 y_noisy, noise = noisy_sinogram(y, snr_db=snr_db, use_variance=True, save_path=None)
 
@@ -205,4 +205,4 @@ os.makedirs(results_dir, exist_ok=True)
 save_path = os.path.join(results_dir, f'ct_astra_3d_l1_basis_pursuit_padmm_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_snr{snr_db}_maxiter{maxiter}.png')
 fig.savefig(save_path)   # save the figure to file
 
-input("\nWaiting for input to close figures and exit")
+# input("\nWaiting for input to close figures and exit")

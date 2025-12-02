@@ -60,14 +60,14 @@ def noisy_sinogram(sinogram, snr_db=30, use_variance=True, save_path=None):
 """
 Create a ground truth image and projector.
 """
-Nx = 64
-Ny = 64
-Nz = 64
+Nx = 512
+Ny = 512
+Nz = 512
 
 # tangle = snp.array(create_tangle_phantom(Nx, Ny, Nz))
 tangle = create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=100)
 
-n_projection = 10  # number of projections
+n_projection = 150  # number of projections
 angles = np.linspace(0, np.pi, n_projection, endpoint=False)  # evenly spaced projection angles
 det_spacing = [1.0, 1.0]
 det_count = [Nz, max(Nx, Ny)]
@@ -123,7 +123,7 @@ gradient sub-iterations used by the ADMM solver in the
 𝛼 = 1e2  # improve problem conditioning by balancing C and D components of A
 λ = 2e0 / 𝛼  # ℓ2,1 norm regularization parameter
 ρ = 5e-3  # ADMM penalty parameter
-maxiter = 500  # number of ADMM iterations
+maxiter = 1000  # number of ADMM iterations
 # maxiter = 1
 
 f = functional.ZeroFunctional()
@@ -208,4 +208,4 @@ os.makedirs(results_dir, exist_ok=True)
 save_path = os.path.join(results_dir, f'ct_astra_3d_tv_padmm_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_snr{snr_db}_maxiter{maxiter}_l1norm.png')
 fig.savefig(save_path)   # save the figure to file
 
-input("\nWaiting for input to close figures and exit")
+# input("\nWaiting for input to close figures and exit")

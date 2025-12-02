@@ -13,7 +13,7 @@ from scico import functional, linop, loss, metric, plot
 from scico.examples import create_tangle_phantom, create_3d_foam_phantom
 from scico.linop.xray.mbirjax import XRayTransformParallel
 from scico.optimize.admm import ADMM, LinearSubproblemSolver
-from scico.optimize import ProxJacobiADMM, ParallelProxJacobiADMM, ParallelProxJacobiADMMv2
+from scico.optimize import ProxJacobiADMM, ParallelProxJacobiADMM, ParallelProxJacobiADMMv2, ParallelProxJacobiADMMUnconstrained
 from scico.util import device_info, create_roi_indices
 from scico.functional import IsotropicTVNorm, L1Norm
 
@@ -83,7 +83,7 @@ to be reconstructed using FBP on each of the GPUs.
 '''
 def pjadmm_parallel_fbp_parallel_noisy_test(
     Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2,
-    rho=1e-3, tau=0.1, tv_weight=1e-2, n_projection=30, maxiter=1000,
+    rho=1e-3, tau=0.1, regularization=1e-2, n_projection=30, maxiter=1000,
     N_sphere=100, sinogram_snr=30
 ):
     '''
@@ -167,9 +167,7 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
             x0_list.append(x0_block)
     
     # Define the TV regularizer for each ROI in the later block reconstruction.
-    # g_list = [IsotropicTVNorm(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]       # ? can I just use prox or not?
-    # Possibility: prox approximation of the TV norm is really poor; choice of parameters is crucial.
-    g_list = [L1Norm() for i in range(len(A_list))]         # Test for the L1 norm reconstruction results.
+    g_list = [IsotropicTVNorm(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]
 
 
     # x_fbp_recon = snp.zeros(x_gt.shape)
@@ -213,7 +211,7 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     ################################################################################################################
     ρ = rho
     τ = tau
-    tv_weight = tv_weight
+    regularization = regularization
 
     
     γ = 1  # Damping parameter in the proximal Jacobi ADMM solver, in the update of the dual variable.
@@ -222,18 +220,18 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     α = 0.8 if correction else None      # Relaxation parameter in the proximal Jacobi ADMM solver, in the correction step. Currently not used.
     maxiter = maxiter  # number of decentralized ADMM iterations
 
-    print(f"ρ: {ρ}, τ: {τ}, regularization: {tv_weight}, γ: {γ}, correction: {correction}, α: {α}, maxiter: {maxiter}")
+    print(f"ρ: {ρ}, τ: {τ}, regularization: {regularization}, γ: {γ}, correction: {correction}, α: {α}, maxiter: {maxiter}")
 
     test_mode = True
 
-    tv_solver = ParallelProxJacobiADMMv2(
+    tv_solver = ParallelProxJacobiADMMUnconstrained(
         A_list=A_list,
         g_list=g_list,
         ρ=ρ,
         y=y_noisy,          # Note we only have the noisy sinogram available instead of the full sinogram.
         τ=τ,
         γ=γ,
-        tv_weight = tv_weight,
+        regularization = regularization,
         λ=λ,
         x0_list=x0_list,
         display_period = 1,
@@ -294,10 +292,9 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     fig.show()
 
     # Save the figure
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_parallel_tv_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_v2')
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_parallel_tv_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_unconstrained')
     os.makedirs(results_dir, exist_ok=True)
-    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
-    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_l1norm_pjadmm_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_tv_weight{tv_weight}_gamma{γ}_maxiter{maxiter}.png')
+    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_unconstrained_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_gamma{γ}_maxiter{maxiter}.png')
     fig.savefig(save_path)   # save the figure to file
 
     print(f"Final SNR: {round(metric.snr(x_gt, x_gt_recon), 2)} (dB), Final MAE: {round(metric.mae(x_gt, x_gt_recon), 3)}")
@@ -325,11 +322,11 @@ if __name__ == "__main__":
     parser.add_argument('--col_division_num', type=int, default=2,
                        help='Number of column divisions (default: 2)')
     parser.add_argument('--rho', type=float, default=1e-3,
-                       help='Regularization parameter (default: 1e-3)')
+                       help='Constraint parameter (default: 1e-3)')
     parser.add_argument('--tau', type=float, default=0.1,
                        help='Step size parameter (default: 0.1)')
-    parser.add_argument('--tv_weight', type=float, default=1e-2,
-                       help='TV regularization weight (default: 1e-2)')
+    parser.add_argument('--regularization', type=float, default=1e-2,
+                       help='Regularization parameter (default: 1e-2)')
     parser.add_argument('--n_projection', type=int, default=30,
                        help='Number of projections (default: 30)')
     parser.add_argument('--maxiter', type=int, default=1000,
@@ -375,7 +372,7 @@ if __name__ == "__main__":
         col_division_num=args.col_division_num,
         rho=args.rho,
         tau=args.tau,
-        tv_weight=args.tv_weight,
+        regularization=args.regularization,
         n_projection=args.n_projection,
         maxiter=args.maxiter,
         N_sphere=args.N_sphere,
