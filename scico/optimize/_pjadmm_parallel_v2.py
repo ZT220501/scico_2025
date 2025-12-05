@@ -162,6 +162,7 @@ class ParallelProxJacobiADMMv2(Optimizer):
         # Manually put the x_list elements on the corresponding GPUs.
         self.x_list = [jax.device_put(x, device) for x, device in zip(self.x_list, self.device_list)]
         self.x_list_prev = self.x_list.copy()
+        self.x_list_prev_prev = self.x_list.copy()
 
         # Initialize global variable Ax = \sum_{i=1}^N A_i(x_i). Make copies on each of the GPUs.
         # The sparse view sinogram Ax will not be memory costly.
@@ -174,7 +175,8 @@ class ParallelProxJacobiADMMv2(Optimizer):
         
         self.res = self.Ax_list[0] - self.y_list[0]
         self.res_prev = self.res.copy()
-
+        self.res_prev_prev = self.res.copy()
+        
         self.row_division_num: int = row_division_num
         self.col_division_num: int = col_division_num
 
@@ -392,7 +394,9 @@ class ParallelProxJacobiADMMv2(Optimizer):
             \mb{\lambda}_i^{(k+1)} =  \mb{\lambda}_i^{(k)} - \gamma \rho_i (\sum_{i=1}^N A_i x^k - y)\;.
         """
         # Store the previous two iterations' x, dual variable λ, and residual.
+        self.x_list_prev_prev = self.x_list_prev.copy()
         self.x_list_prev = self.x_list.copy()
+        self.res_prev_prev = self.res_prev.copy()
         self.res_prev = self.res.copy()
         self.λ_prev_list = self.λ_list.copy()
 
@@ -457,7 +461,9 @@ class ParallelProxJacobiADMMv2(Optimizer):
             res_replicated = jax.device_put_replicated(self.res, self.device_list)
             self.λ_list = update_lambda_back(self.λ_list, res_replicated)
             self.x_list = self.x_list_prev.copy()
+            self.x_list_prev = self.x_list_prev_prev.copy()
             self.res = self.res_prev.copy()
+            self.res_prev = self.res_prev_prev.copy()
         # elif self.itnum % 100 == 0:
         #     # Decrase τ after every a pre-defined number of iterations.
         #     self.τ = self.τ * 1.2
