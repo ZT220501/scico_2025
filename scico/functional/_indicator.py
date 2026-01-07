@@ -121,4 +121,4 @@ class L2BallIndicator(Functional):
         Returns:
             Result of evaluating the scaled proximal operator at `v`.
         """
-        return self.radius * v / norm(v)
+        return self.radius * v / norm(v) if norm(v) > self.radius else v

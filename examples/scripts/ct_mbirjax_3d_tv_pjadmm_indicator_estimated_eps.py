@@ -2,9 +2,9 @@ import numpy as np
 import jax
 import os
 import jax.numpy as jnp
-# Force GPU usage
-os.environ['JAX_PLATFORM_NAME'] = 'gpu'
-jax.config.update('jax_platform_name', 'gpu')
+# # Force GPU usage
+# os.environ['JAX_PLATFORM_NAME'] = 'gpu'
+# jax.config.update('jax_platform_name', 'gpu')
 
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
@@ -21,14 +21,35 @@ import scipy.io
 import argparse
 import sys
 from datetime import datetime
+import gc
 
 import matplotlib.pyplot as plt
 
 
-def noisy_sinogram(sinogram, snr_db=30, use_variance=True, save_path=None):
+def cleanup_memory():
+    """
+    Comprehensive memory cleanup function.
+    Clears Python variables, JAX cache, and forces garbage collection.
+    """
+    # Close all matplotlib figures
+    plt.close('all')
+    
+    # Clear JAX backend caches (important for GPU memory)
+    try:
+        jax.clear_backends()
+        jax.clear_caches()
+    except AttributeError:
+        # Fallback for older JAX versions
+        pass
+    
+    # Force garbage collection
+    gc.collect()
+    gc.collect()  # Call twice to handle circular references
+
+
+def noisy_sinogram(sinogram, snr_db=30, use_variance=True, save_path=None, seed=42):
     """Add Poisson noise to the sinogram, so that SNR is around snr_db dB."""
     # Set the seed for reproducibility.
-    seed = 42
     np.random.seed(seed)
 
     if use_variance:
@@ -41,7 +62,7 @@ def noisy_sinogram(sinogram, snr_db=30, use_variance=True, save_path=None):
     sinogram_noisy = sinogram + noise
     if save_path is not None:
         save_recon_comparision(sinogram, sinogram_noisy, save_path)
-    return sinogram_noisy, noise
+    return sinogram_noisy, noise, sigma_n
 
 
 def save_recon_comparision(x_gt, x_recon, save_path):
@@ -84,7 +105,7 @@ to be reconstructed using FBP on each of the GPUs.
 def pjadmm_parallel_fbp_parallel_noisy_test(
     Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2,
     rho=1e-3, tau=0.1, regularization=1e-2, n_projection=30, maxiter=1000,
-    N_sphere=100, sinogram_snr=30, eps=1e-6
+    N_sphere=100, sinogram_snr=30, regularization_type="l1"
 ):
     '''
     Create a ground truth image and projector.
@@ -117,9 +138,21 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     y = A_full @ x_gt
     print("Creating the noisy sinogram...")
     sinogram_snr = int(sinogram_snr)
-    y_noisy, noise = noisy_sinogram(y, snr_db=sinogram_snr, use_variance=True, save_path=os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "noisy_sinogram.png"))
+    y_noisy, noise, sigma = noisy_sinogram(y, snr_db=sinogram_snr, use_variance=True, save_path=os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "noisy_sinogram.png"))
 
-    print("The 2 norm of the sinogram difference is: ", snp.linalg.norm(y_noisy - y))
+    # Estimate the noise level, by using another measurement of the noise level.
+    y_noisy_2, noise_2, sigma_2 = noisy_sinogram(y, snr_db=sinogram_snr, use_variance=True, save_path=os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "noisy_sinogram_2.png"), seed=23411423)
+    diff = y_noisy - y_noisy_2
+    sigma_estimated = snp.linalg.norm(diff) / snp.sqrt(2*max(Nx, Ny)*n_projection*Nz)
+    noise_estimated = np.random.normal(0.0, sigma_estimated, size=y_noisy.shape).astype(np.float32)
+    print("True L2 norm is: ", snp.linalg.norm(y_noisy - y))
+    eps_estimated = snp.linalg.norm(noise_estimated)
+    print("Estimated L2 norm is: ", eps_estimated)
+
+    # # Use the true noise level to estimate the ε.
+    # eps_estimated = snp.linalg.norm(noise)
+    # print("True L2 norm is: ", snp.linalg.norm(y_noisy - y))
+    # print("The ε used is: ", eps_estimated)
 
     '''
     Set up problems and solvers for TV regularized solver, block reconstruction using proximal Jacobi ADMM.
@@ -162,58 +195,24 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
             A_list.append(A)
             # Do the FBP on each of the GPUs by using the ROI FBP.
             print("FBP on GPU %d..." % device_idx)
-            y_noisy = jax.device_put(y_noisy, gpu_devices[device_idx])
             x0_block = A.fbp_recon(y_noisy, device="gpu")
             device_idx += 1         # Update the GPU device index to put the block on.
             x0_list.append(x0_block)
     
     # Define the TV regularizer for each ROI in the later block reconstruction.
-    g_list = [IsotropicTVNorm(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]
+    if regularization_type == "tv":
+        g_list = [IsotropicTVNorm(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]
+    elif regularization_type == "l1":
+        g_list = [L1Norm() for i in range(len(A_list))]
+    else:
+        raise ValueError(f"Regularization type {regularization_type} not supported.")
+        exit()
 
-
-    # x_fbp_recon = snp.zeros(x_gt.shape)
-    # for i in range(row_division_num):
-    #     for j in range(col_division_num):
-    #         roi_start_row, roi_end_row = i * Nx // row_division_num, (i + 1) * Nx // row_division_num  # Selected rows
-    #         roi_start_col, roi_end_col = j * Ny // col_division_num, (j + 1) * Ny // col_division_num  # Selected columns
-    #         x_fbp_recon = x_fbp_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(jax.device_put(x0_list[i * col_division_num + j], gpu_devices[0]))
-
-    # save_recon_comparision(x_gt, x_fbp_recon, os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", f"noisy_sinogram_{n_projection}views.png"))
-    # exit()
-
-    ################################################################################################################
-    # # This is the best setting for the problem of large size.
-    # In the Proximal Jacobi ADMM solver, tau is updated as 
-    # if lower_bound < 0:
-    #     print("τ is doubled at iteration ", self.itnum)
-    #     self.τ = self.τ * 2
-
-    #     # Revert back the variables.
-    #     self.x_list = self.x_list_prev
-    #     self.λ = self.λ + self.γ * self.ρ * (sum(self.A_list[i](self.x_list[i]) for i in range(self.N)) - self.y)
-    #     self.λ = jax.device_put(self.λ, self.device)
-    #     # Revert back the stored variables.
-    #     self.x_list = self.x_list_prev.copy()
-    #     self.res = self.res_prev.copy()
-    #     self.x_list_prev = self.x_list_two_prev.copy()
-    #     self.res_prev = self.res_two_prev.copy()
-    # elif self.itnum % 10 == 0:
-    #     # Decrase τ after every a pre-defined number of iterations.
-    #     self.τ = self.τ / 1.2
-
-    # The minimization parameter setting is as follows: for small size problems,
-    # ρ = 1e-3
-    # τ = 0.1
-    # tv_weight = 1e-2
-    # For large size problems,
-    # ρ = 1e-4
-    # τ = 0.1
-    # tv_weight = 1e-2
-    ################################################################################################################
+    # Define the algorithm parameters.
     ρ = rho
     τ = tau
     regularization = regularization
-    ε = eps
+    ε = eps_estimated
     
     γ = 1  # Damping parameter in the proximal Jacobi ADMM solver, in the update of the dual variable.
     λ = snp.zeros(A_list[0].output_shape, dtype=A_list[0].output_dtype)  # Dual variable
@@ -221,7 +220,7 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     α = 0.8 if correction else None      # Relaxation parameter in the proximal Jacobi ADMM solver, in the correction step. Currently not used.
     maxiter = maxiter  # number of decentralized ADMM iterations
 
-    print(f"ρ: {ρ}, τ: {τ}, regularization: {regularization}, ε: {ε}, γ: {γ}, correction: {correction}, α: {α}, maxiter: {maxiter}")
+    print(f"ρ: {ρ}, τ: {τ}, regularization: {regularization}, ε: {ε}, γ: {γ}, correction: {correction}, α: {α}, maxiter: {maxiter}, regularization_type: {regularization_type}")
 
     test_mode = True
 
@@ -294,21 +293,29 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     fig.show()
 
     # Save the figure
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_parallel_tv_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_indicator')
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_indicator_estimated_eps')
     os.makedirs(results_dir, exist_ok=True)
-    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_tv_pjadmm_indicator_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_ε{ε}_gamma{γ}_maxiter{maxiter}.png')
+    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_pjadmm_indicator_estimated_eps_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_ε{eps_estimated}_gamma{γ}_maxiter{maxiter}.png')
     fig.savefig(save_path)   # save the figure to file
 
     # Save the result to a txt file
-    with open(os.path.join(results_dir, f'results.txt'), 'w') as f:
-        f.write(f"Test configuration: Nx: {Nx}, Ny: {Ny}, Nz: {Nz}, row_division_num: {row_division_num}, col_division_num: {col_division_num}, rho: {rho}, tau: {tau}, regularization: {regularization}, eps: {eps}, n_projection: {n_projection}, maxiter: {maxiter}, N_sphere: {N_sphere}, sinogram_snr: {sinogram_snr}\n")
-        f.write(f"Final SNR: {round(metric.snr(x_gt, x_gt_recon), 2)} (dB), Final MAE: {round(metric.mae(x_gt, x_gt_recon), 3)}")
+    results_file = os.path.join(results_dir, f'results.txt')
+    with open(results_file, 'a') as f:
+        f.write(f"Test configuration: Nx: {Nx}, Ny: {Ny}, Nz: {Nz}, row_division_num: {row_division_num}, col_division_num: {col_division_num}, rho: {rho}, tau: {tau}, regularization: {regularization}, eps: {eps_estimated}, n_projection: {n_projection}, maxiter: {maxiter}, N_sphere: {N_sphere}, sinogram_snr: {sinogram_snr}, regularization_type: {regularization_type}\n")
+        f.write(f"Final SNR: {round(metric.snr(x_gt, x_gt_recon), 2)} (dB), Final MAE: {round(metric.mae(x_gt, x_gt_recon), 3)}\n")
+        f.write("---------------------------------------------------------\n")
     print(f"Final SNR: {round(metric.snr(x_gt, x_gt_recon), 2)} (dB), Final MAE: {round(metric.mae(x_gt, x_gt_recon), 3)}")
+    
+    # Save the reconstruction result for replotting
+    snp.save(os.path.join(results_dir, f"x_gt_recon_parallel_noisy_{n_projection}views_snr{sinogram_snr}_ρ{ρ}_τ{τ}_regularization{regularization}_ε{eps_estimated}_gamma{γ}_maxiter{maxiter}.npy"), x_gt_recon)
+    
     return x_gt_recon
 
 
 
 if __name__ == "__main__":    
+
+    cleanup_memory()
 
     # Set up argument parser
     parser = argparse.ArgumentParser(
@@ -333,8 +340,6 @@ if __name__ == "__main__":
                        help='Step size parameter (default: 0.1)')
     parser.add_argument('--regularization', type=float, default=1e-2,
                        help='Regularization parameter (default: 1e-2)')
-    parser.add_argument('--eps', type=float, default=1e-6,
-                       help='Epsilon parameter (default: 1e-6)')
     parser.add_argument('--n_projection', type=int, default=30,
                        help='Number of projections (default: 30)')
     parser.add_argument('--maxiter', type=int, default=1000,
@@ -343,6 +348,8 @@ if __name__ == "__main__":
                        help='Number of spheres in the foam phantom (default: 100)')
     parser.add_argument('--sinogram_snr', type=float, default=30,
                        help='SNR of the sinogram in dB (default: 30)')
+    parser.add_argument('--regularization_type', type=str, default="tv",
+                       help='Regularization type (default: tv)')
     # Parse arguments
     args = parser.parse_args()
     
@@ -352,6 +359,7 @@ if __name__ == "__main__":
     
     if args.row_division_num <= 0 or args.col_division_num <= 0:
         parser.error("Division numbers must be positive integers")
+
     
     # Display configuration
     print("="*100)
@@ -364,6 +372,7 @@ if __name__ == "__main__":
     print(f"  Total blocks: {args.row_division_num * args.col_division_num}")
     print(f"  Number of projections: {args.n_projection}")
     print(f"  Number of iterations for block reconstruction: {args.maxiter}")
+    print(f"  Regularization type: {args.regularization_type}")
     print("="*80)
     
     # Run the test
@@ -381,10 +390,11 @@ if __name__ == "__main__":
         rho=args.rho,
         tau=args.tau,
         regularization=args.regularization,
-        eps=args.eps,
         n_projection=args.n_projection,
         maxiter=args.maxiter,
         N_sphere=args.N_sphere,
-        sinogram_snr=args.sinogram_snr
+        sinogram_snr=args.sinogram_snr,
+        regularization_type=args.regularization_type
     )
     print("\n✅ Test completed!")
+    print("="*80)

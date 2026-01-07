@@ -115,7 +115,7 @@ class XRayTransformParallel(LinearOperator):
     def fbp_recon(self, y: snp.Array, device: str = 'cpu') -> snp.Array:
         # Convert the sinogram to the mbirjax convention.
         y_device = y.device         # Store the device of the sinogram for GPU fbp reconstruction.
-        y = y.transpose(1, 0, 2)
+        y = jax.device_put(y.transpose(1, 0, 2), y_device)
         view_batch_size = len(self.model.get_params("angles"))
         # Create the filtered sinogram, in the mbirjax convention.
         filtered_sinogram = self.model.fbp_filter(y, filter_name="ramp", view_batch_size=view_batch_size)

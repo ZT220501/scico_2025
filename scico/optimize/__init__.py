@@ -24,6 +24,8 @@ from ._pjadmm_parallel import ParallelProxJacobiADMM
 from ._pjadmm_parallel_v2 import ParallelProxJacobiADMMv2
 from ._pjadmm_parallel_unconstrained import ParallelProxJacobiADMMUnconstrained
 from ._pjadmm_parallel_indicator import ParallelProxJacobiADMMIndicator
+from ._semipjadmm_parallel_indicator import ParallelSemiProxJacobiADMMIndicator
+from ._semipjadmm_parallel_l2tv import ParallelSemiProxJacobiADMML2TV
 
 __all__ = [
     "ADMM",
@@ -43,6 +45,8 @@ __all__ = [
     "ParallelProxJacobiADMMv2",
     "ParallelProxJacobiADMMUnconstrained",
     "ParallelProxJacobiADMMIndicator",
+    "ParallelSemiProxJacobiADMMIndicator",
+    "ParallelSemiProxJacobiADMML2TV",
 ]
 
 # Imported items in __all__ appear to originate in top-level linop module

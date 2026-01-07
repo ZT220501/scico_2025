@@ -38,10 +38,9 @@ from scico.util import device_info
 import os
 
 
-def noisy_sinogram(sinogram, snr_db=30, use_variance=True, save_path=None):
+def noisy_sinogram(sinogram, snr_db=30, use_variance=True, seed=42):
     """Add Poisson noise to the sinogram, so that SNR is around snr_db dB."""
     # Set the seed for reproducibility.
-    seed = 42
     np.random.seed(seed)
 
     if use_variance:
@@ -52,8 +51,6 @@ def noisy_sinogram(sinogram, snr_db=30, use_variance=True, save_path=None):
     sigma_n = np.sqrt(P_signal / (10**(snr_db/10.0)))
     noise = np.random.normal(0.0, sigma_n, size=sinogram.shape).astype(np.float32)
     sinogram_noisy = sinogram + noise
-    if save_path is not None:
-        save_recon_comparision(sinogram, sinogram_noisy, save_path)
     return sinogram_noisy, noise
 
 
@@ -67,7 +64,7 @@ Nz = 512
 # tangle = snp.array(create_tangle_phantom(Nx, Ny, Nz))
 tangle = create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=100)
 
-n_projection = 150  # number of projections
+n_projection = 100  # number of projections
 angles = np.linspace(0, np.pi, n_projection, endpoint=False)  # evenly spaced projection angles
 det_spacing = [1.0, 1.0]
 det_count = [Nz, max(Nx, Ny)]
@@ -84,7 +81,16 @@ print("shape of C is: ", C.shape)
 y = C @ tangle  # sinogram
 snr_db = int(50)
 print(f"SNR of sinogram: {snr_db} dB")
-y_noisy, noise = noisy_sinogram(y, snr_db=snr_db, use_variance=True, save_path=None)
+y_noisy, noise = noisy_sinogram(y, snr_db=snr_db, use_variance=True)
+
+# Estimate the noise level, by using another measurement of the noise level.
+y_noisy_2, noise_2 = noisy_sinogram(y, snr_db=snr_db, use_variance=True, seed=23411423)
+diff = y_noisy - y_noisy_2
+sigma_estimated = snp.linalg.norm(diff) / snp.sqrt(2*max(Nx, Ny)*n_projection*Nz)
+noise_estimated = np.random.normal(0.0, sigma_estimated, size=y_noisy.shape).astype(np.float32)
+eps_estimated = snp.linalg.norm(noise_estimated)
+print("True L2 norm is: ", snp.linalg.norm(y_noisy - y))
+print("Estimated L2 norm is: ", eps_estimated)
 
 r"""
 Set up problem and solver. We want to minimize the functional
@@ -123,27 +129,22 @@ gradient sub-iterations used by the ADMM solver in the
 𝛼 = 1e2  # improve problem conditioning by balancing C and D components of A
 λ = 2e0 / 𝛼  # ℓ2,1 norm regularization parameter
 ρ = 5e-3  # ADMM penalty parameter
-maxiter = 500  # number of ADMM iterations
-# maxiter = 1
+maxiter = 1000  # number of ADMM iterations
 
 regularization_type = "tv"
-print(f"Regularization type: {regularization_type}")
+print(f"Regularization type: {regularization_type}, maxiter: {maxiter}")
 
-f = functional.ZeroFunctional()
-# g0 = loss.SquaredL2Loss(y=y)
-g0 = loss.SquaredL2Loss(y=y_noisy)
 if regularization_type == "tv":
-    g1 = λ * functional.L21Norm()
-    D = linop.FiniteDifference(input_shape=tangle.shape, append=0)
+    f = λ * functional.IsotropicTVNorm(input_shape=C.input_shape, input_dtype=C.input_dtype)
 elif regularization_type == "l1":
-    g1 = λ * functional.L1Norm()
-    D = linop.Identity(input_shape=tangle.shape)
+    f = λ * functional.L1Norm()
 else:
     raise ValueError(f"Regularization type {regularization_type} not supported.")
     exit()
 
-g = functional.SeparableFunctional((g0, g1))
-A = linop.VerticalStack((C, 𝛼 * D))
+g = functional.L2BallIndicator(radius=eps_estimated)
+A = C
+B = -linop.Identity(input_shape=y_noisy.shape)
 
 # FBP initial guess
 sinogram_shape = (Nz, n_projection, max(Nx, Ny))
@@ -161,13 +162,15 @@ solver = ProximalADMM(
     f=f,
     g=g,
     A=A,
-    B=None,
+    B=B,
     rho=ρ,
     mu=mu,
     nu=nu,
     maxiter=maxiter,
     itstat_options={"display": True, "period": 50},
-    x0=x0
+    x0=x0,
+    c=y_noisy,
+    x_gt=tangle
 )
 
 """
@@ -211,9 +214,9 @@ fig.show()
 
 # Save the figure
 # results_dir = os.path.join(os.path.dirname(__file__), f'results/ct_astra_3d_tv_padmm')
-results_dir = os.path.join(os.path.dirname(__file__), f'results/ct_astra_3d_{regularization_type}_padmm_fbp_initial')
+results_dir = os.path.join(os.path.dirname(__file__), f'results/ct_astra_3d_{regularization_type}_padmm_fbp_initial_indicator')
 os.makedirs(results_dir, exist_ok=True)
-save_path = os.path.join(results_dir, f'ct_astra_3d_{regularization_type}_padmm_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_snr{snr_db}_maxiter{maxiter}.png')
+save_path = os.path.join(results_dir, f'ct_astra_3d_{regularization_type}_padmm_recon_{n_projection}views_{Nx}x{Ny}x{Nz}_snr{snr_db}_maxiter{maxiter}_indicator.png')
 fig.savefig(save_path)   # save the figure to file
 
 # input("\nWaiting for input to close figures and exit")

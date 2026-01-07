@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import List, Optional, Tuple, Union
 
 import scico.numpy as snp
-from scico import cvjp, jvp
+from scico import cvjp, jvp, metric
 from scico.function import Function
 from scico.functional import Functional
 from scico.linop import Identity, LinearOperator, operator_norm
@@ -233,6 +233,7 @@ class ProximalADMM(ProximalADMMBase):
         z0: Optional[Union[Array, BlockArray]] = None,
         u0: Optional[Union[Array, BlockArray]] = None,
         fast_dual_residual: bool = True,
+        x_gt: Optional[Union[Array, BlockArray]] = None,
         **kwargs,
     ):
         r"""Initialize a :class:`ProximalADMM` object.
@@ -268,6 +269,10 @@ class ProximalADMM(ProximalADMMBase):
             self.c = 0.0
         else:
             self.c = c
+        
+        # Pass in the ground truth image for test purpose.
+        if x_gt is not None:
+            self.x_gt = x_gt
 
         super().__init__(
             f,
@@ -342,6 +347,25 @@ class ProximalADMM(ProximalADMMBase):
         else:
             rsdl = self.A.H(self.B(self.z - self.z_old))
         return norm(rsdl)
+
+    ################################################################################
+    # The SNR calculation is for test purpose and should be removed in the future.
+    def snr(self):
+        return metric.snr(self.x_gt, self.x)
+
+    # Test for the indicator formulation. 
+    def distance(self):
+        return norm(self.A(self.x) - self.c)
+
+    def _itstat_extra_fields(self):
+        """Define ADMM-specific iteration statistics fields."""
+        itstat_fields = {"Prml Rsdl": "%9.3e", "Dual Rsdl": "%9.3e", "SNR": "%9.3e", "distance": "%9.3e"}
+        itstat_attrib = ["norm_primal_residual()", "norm_dual_residual()", "snr()", "distance()"]
+
+        return itstat_fields, itstat_attrib
+    # End of the test purpose code. 
+    # NOTE: Should be removed in the future before merging to the main branch.
+    ################################################################################
 
     def step(self):
         r"""Perform a single algorithm iteration.

@@ -43,7 +43,7 @@ from ._common import Optimizer
 
 # TODO: Finish writing the actual multi-GPU version of proximal Jacobi ADMM.
 # Think more about where/how to store the sinogram acrossGPUs.
-class ParallelProxJacobiADMMIndicator(Optimizer):
+class ParallelSemiProxJacobiADMML2TV(Optimizer):
     r"""Proximal Jacobi Alternating Direction Method of Multipliers (ADMM) algorithm.
     For reference, see https://link.springer.com/article/10.1007/s10915-016-0318-2.
 
@@ -63,7 +63,6 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
         τ: float,
         γ: float,
         regularization: float,
-        ε: float,
         λ: Optional[Array] = None,
         x0_list: Optional[List[Union[Array, BlockArray]]] = None,
         display_period: int = 5,
@@ -142,7 +141,6 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
         self.γ: float = γ                                # Damping parameter.
         self.τ: float = τ                                # Proximal weight.
         self.regularization: float = regularization      # Regularization weight.
-        self.ε: float = ε                                # Epsilon for the ||Ax-y||_2 <= ε.
         self.display_period: int = display_period        # Display period for the ADMM solver.
         self.with_correction: bool = with_correction    # Whether to use the correction term.
 
@@ -176,17 +174,13 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
             Ax = jax.device_put(Ax, self.device_list[i])
             Ax += self.A_list[i](self.x_list[i])
         self.Ax_list = [jax.device_put(Ax, device) for device in self.device_list]
+        self.Ax_list_prev = self.Ax_list.copy()
+        self.Ax_list_prev_prev = self.Ax_list_prev.copy()
         
         # Initialize the auxiliary indicator variable z, and store it on each of the GPUs.
-        initial_diff = self.Ax_list[0] - self.y_list[0]
-        self.z_list = [jax.device_put(initial_diff, device) for device in self.device_list]
+        self.z_list = [jax.device_put(self.Ax_list[0], device) for device in self.device_list]
         self.z_list_prev = self.z_list.copy()
         self.z_list_prev_prev = self.z_list_prev.copy()
-
-        # Initialize the residual.
-        self.res = self.Ax_list[0] - self.z_list[0] - self.y_list[0]
-        self.res_prev = self.res.copy()
-        self.res_prev_prev = self.res.copy()
 
         self.row_division_num: int = row_division_num
         self.col_division_num: int = col_division_num
@@ -204,7 +198,7 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
     # Parallel x-update step for x on different GPUs.
     def x_update(self, worker_index: int):
         # x-update step.
-        grad = self.ρ * self.A_list[worker_index].T(self.Ax_list[worker_index] - self.z_list[worker_index] - self.y_list[worker_index] - self.λ_list[worker_index] / self.ρ)
+        grad = self.ρ * self.A_list[worker_index].T(self.Ax_list[worker_index] - self.z_list[worker_index] - self.λ_list[worker_index] / self.ρ)
         self.x_list[worker_index] = self.g_list[worker_index].prox(self.x_list[worker_index] - 1 / self.τ * grad, self.regularization / self.τ)
             
     # Parallel Ax update step for Ax on different GPUs.
@@ -225,23 +219,9 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
     # Parallel z-update step for z on different GPUs.
     def z_update(self):
         """Update the auxilliary indicator variable z, by using the proximal operator of the L2 ball indicator."""
-        # Compute the gradient.
-        grad = -self.ρ * (self.Ax_list[0] - self.z_list[0] - self.y_list[0] - self.λ_list[0] / self.ρ)
-        z = self.z_list[0] - 1 / self.τ * grad
-        # Update the auxilliary indicator variable z by L2 projection onto the feasible set.
-        if snp.linalg.norm(z) > self.ε:
-            z = z / snp.linalg.norm(z) * self.ε
-        else:
-            z = z
+        # Compute the optimal z, possibly with a scaling.
+        z = 1 / (1 + self.ρ) * (self.y_list[0] + self.ρ * self.Ax_list[0] - self.λ_list[0])
         self.z_list = [jax.device_put(z, device) for device in self.device_list]
-
-    # Parallel residual update step for residual on the first GPU.
-    def residual_update(self):
-        """Update the residual, by first updating the predicted sinogram, and then subtracting the ground truth sinogram."""
-        # Update the global variable Ax = \sum_{i=1}^N A_ix_i.
-        self.Ax_update()
-        self.res = self.Ax_list[0] - self.z_list[0] - self.y_list[0]
-        # print("The maximum of the indicator variable z is: ", snp.max(abs(self.z_list[0])))
 
     def get_residual_on_device(self, device_index: int = 0):
         """Get the residual value from a specific GPU device.
@@ -291,16 +271,16 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
         # return all([_.has_eval for _ in self.A_list]) and all([_.has_eval for _ in self.g_list])
         return True
     
-    def distance(self):
-        return snp.linalg.norm(self.Ax_list[0] - self.y_list[0])
+    # def distance(self):
+    #     return snp.linalg.norm(self.Ax_list[0] - self.y_list[0])
     
-    def z_norm(self):
-        return snp.linalg.norm(self.z_list[0])
+    # def z_norm(self):
+    #     return snp.linalg.norm(self.z_list[0])
 
     def _itstat_extra_fields(self):
         """Define ADMM-specific iteration statistics fields."""
-        itstat_fields = {"Prml Rsdl": "%9.3e", "Dual Rsdl": "%9.3e", "Distance": "%9.3e", "z Norm": "%9.3e"}
-        itstat_attrib = ["norm_primal_residual()", "norm_dual_residual()", "distance()", "z_norm()"]
+        itstat_fields = {"Prml Rsdl": "%9.3e", "Dual Rsdl": "%9.3e", "Regularization": "%9.3e", "Constraint": "%9.3e"}
+        itstat_attrib = ["norm_primal_residual()", "norm_dual_residual()", "regularization_value()", "constraint_value()"]
 
         return itstat_fields, itstat_attrib
 
@@ -326,13 +306,16 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
 
         return metric.snr(self.ground_truth, tangle_recon)
 
-    def tv(self) -> float:
+    def regularization_value(self) -> float:
         out = 0.0
         for i in range(self.N):
             out = jax.device_put(out, self.device_list[i])
             out += self.regularization * self.g_list[i](self.x_list[i])
         out = jax.device_put(out, self.device_list[0])
         return out
+
+    def constraint_value(self) -> float:
+        return 1 / 2 * snp.linalg.norm(self.z_list[0] - self.y_list[0])**2
 
     def objective(self) -> float:
         r"""Evaluate the objective function.
@@ -361,10 +344,7 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
         Returns:
             Value of the objective function.
         """
-        if snp.linalg.norm(self.z_list[0]) <= self.ε * 1.1:
-            return self.tv()
-        else:
-            return snp.inf
+        return self.regularization_value() + self.constraint_value()
 
     def norm_primal_residual(self, x_list: Optional[Union[Array, BlockArray]] = None) -> float:
         r"""Compute the :math:`\ell_2` norm of the primal residual.
@@ -383,7 +363,7 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
         Returns:
             Norm of primal residual.
         """        
-        return snp.linalg.norm(self.Ax_list[0] - self.z_list[0] - self.y_list[0])
+        return snp.linalg.norm(self.Ax_list[0] - self.z_list[0])
 
     # This is the dual residual formulation for the indicator problem.
     def norm_dual_residual(self) -> float:
@@ -421,8 +401,8 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
         # Store the previous two iterations' x, dual variable λ, and residual.
         self.x_list_prev_prev = self.x_list_prev.copy()
         self.x_list_prev = self.x_list.copy()
-        self.res_prev_prev = self.res_prev.copy()
-        self.res_prev = self.res.copy()
+        self.Ax_list_prev_prev = self.Ax_list_prev.copy()
+        self.Ax_list_prev = self.Ax_list.copy()
         self.λ_list_prev_prev = self.λ_list_prev.copy()
         self.λ_list_prev = self.λ_list.copy()
         self.z_list_prev_prev = self.z_list_prev.copy()
@@ -430,26 +410,24 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
 
         # Update the predicted sinogram \sum_{i=1}^N A_ix_i for proximal Jacobi ADMM update.
         self.Ax_update()
-
         # Update each of the x_i in parallel.
         for i in range(self.N):
             self.x_update(i)
         jax.block_until_ready(self.x_list)
+        # Update the predicted sinogram \sum_{i=1}^N A_ix_i again, so that the z-update is Gauss-Seidel.
+        self.Ax_update()
         # Update the auxilliary indicator variable z
         self.z_update()
-        
-        # Update the residual \sum_{i=1}^N A_ix_i - z - y.
-        self.residual_update()
 
         # Update dual variable λ
         @jax.pmap
         def update_lambda(λ, res):
             return λ - self.γ * self.ρ * res
-        res_replicated = jax.device_put_replicated(self.res, self.device_list)
+        res_replicated = jax.device_put_replicated(self.Ax_list[0] - self.z_list[0], self.device_list)
         self.λ_list = update_lambda(self.λ_list, res_replicated)
 
         # Compute 2/gamma*(lambda^k-lambda^{k+1})'*A(x^k-x^{k+1})
-        cross_term = 2 * self.ρ * snp.dot(self.res.reshape(-1), (self.res_prev - self.res).reshape(-1))
+        cross_term = 2 / self.γ * snp.dot((self.λ_list_prev[0] - self.λ_list[0]).reshape(-1), (self.Ax_list_prev[0] - self.Ax_list[0]).reshape(-1))
         # Compute ||x^k-x^{k+1}||^2_G
         dx_norm = 0
         for i in range(self.N):
@@ -458,12 +436,8 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
             norm_squared = snp.linalg.norm(diff)**2 * self.τ
             norm_squared = jax.device_put(norm_squared, self.device_list[0])
             dx_norm += norm_squared
-        diff = (self.z_list[0] - self.z_list_prev[0]).reshape(-1)       # Account for the indicator term.
-        norm_squared = snp.linalg.norm(diff)**2 * self.τ
-        norm_squared = jax.device_put(norm_squared, self.device_list[0])
-        dx_norm += norm_squared
         # Compute (2-gamma)/(rho*gamma^2)*||lambda^k-lambda^{k+1}||^2
-        d_lambda_norm = (2 - self.γ) * self.ρ * snp.linalg.norm(self.res)**2
+        d_lambda_norm = (2 - self.γ) / (self.ρ * self.γ**2) * snp.linalg.norm(self.λ_list[0] - self.λ_list_prev[0])**2
         # Compute the lower bound of error decrease: h(u^k,u^{k+1})
         lower_bound = dx_norm + d_lambda_norm + cross_term
 
@@ -479,10 +453,10 @@ class ParallelProxJacobiADMMIndicator(Optimizer):
             self.λ_list_prev = self.λ_list_prev_prev.copy()
             self.x_list = self.x_list_prev.copy()
             self.x_list_prev = self.x_list_prev_prev.copy()
+            self.Ax_list = self.Ax_list_prev.copy()
+            self.Ax_list_prev = self.Ax_list_prev_prev.copy()
             self.z_list = self.z_list_prev.copy()
             self.z_list_prev = self.z_list_prev_prev.copy()
-            self.res = self.res_prev.copy()
-            self.res_prev = self.res_prev_prev.copy()
         # '''
         # end of test block.
         # '''
