@@ -23,6 +23,7 @@ from scico.linop import LinearOperator
 from scico.numpy import Array, BlockArray
 from scico.numpy.linalg import norm
 from scico.optimize.admm import ADMM
+from scico.optimize import PDHG
 from scico import functional, linop, loss, metric, plot
 from scico.util import Timer
 import jax
@@ -43,7 +44,7 @@ from ._common import Optimizer
 
 # TODO: Finish writing the actual multi-GPU version of proximal Jacobi ADMM.
 # Think more about where/how to store the sinogram acrossGPUs.
-class ParallelSemiProxJacobiADMML2TV(Optimizer):
+class ParallelSemiProxJacobiADMML2PlusRegIterativeRegEstimatedPDHG(Optimizer):
     r"""Proximal Jacobi Alternating Direction Method of Multipliers (ADMM) algorithm.
     For reference, see https://link.springer.com/article/10.1007/s10915-016-0318-2.
 
@@ -58,6 +59,7 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
         self,
         A_list: List[LinearOperator],
         g_list: List[Functional],
+        C_list: List[LinearOperator],
         ρ: float,
         y: Array,
         τ: float,
@@ -74,6 +76,8 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
         col_division_num: int = 8,
         device_list: List[str] = None,
         num_processes: int = None,
+        maxiter_pdhg: int = 5,
+        tau_decrease: bool = True,
         **kwargs,
     ):
         r"""Initialize an :class:`ProxJacobiADMM` object.
@@ -134,15 +138,28 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
         self.ground_truth: Optional[Array] = ground_truth
 
         self.A_list: List[LinearOperator] = A_list      # List of partial forward sinogram projection operators typically.
-        self.g_list: List[Functional] = g_list          # List of TV regularizers typically.
+        self.g_list: List[Functional] = g_list          # List of outer level regularizers typically (eg. L1; L2,1).
+        self.C_list: List[LinearOperator] = C_list      # List of inner level regularization operators typically (eg. finite difference; identity).
 
         self.ρ: float = ρ                               # ADMM penalty parameter.
-        self.y_list: List[Array] = [jax.device_put(y, device) for device in self.device_list]  # Ground truth full sinogram on each of the GPUs.
+        # self.y_list: List[Array] = [jax.device_put(y, device) for device in self.device_list]  # Ground truth full sinogram on each of the GPUs.
+        self.y = jax.device_put(y, self.device_list[0])  # Ground truth full sinogram on the first GPU.
         self.γ: float = γ                                # Damping parameter.
         self.τ: float = τ                                # Proximal weight.
         self.regularization: float = regularization      # Regularization weight.
         self.display_period: int = display_period        # Display period for the ADMM solver.
         self.with_correction: bool = with_correction    # Whether to use the correction term.
+
+        self.maxiter_pdhg: int = maxiter_pdhg            # Number of iterations for PDHG.
+        self.τ_pdhg_list: List[float] = []
+        self.σ_pdhg_list: List[float] = []
+        for C in self.C_list:
+            # Estimate the τ and σ parameters for PDHG for each subproblem, using the default estimation parameters.
+            τ_pdhg, σ_pdhg = PDHG.estimate_parameters(C)
+            self.τ_pdhg_list.append(τ_pdhg)
+            self.σ_pdhg_list.append(σ_pdhg)
+
+        self.tau_decrease: bool = tau_decrease            # Whether to use tau decrease in the PJADMM; here τ is the ADMM proximal weight.
 
         # Initialize the dual variable λ, and store it on each of the GPUs.
         if λ is None:
@@ -193,13 +210,43 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
             return A_apply_single
         self._A_apply_fns = [_make_A_apply_fn(Ai) for Ai in self.A_list]
 
-        super().__init__(**kwargs)
+        # Auxiliary functions for the parallelization of the x update.
+        # These are pure functions (no side effects) that can be JIT-compiled.
+        def _make_x_update_fn(A_i, g_i, C_i, τ_pdhg, σ_pdhg):
+            # Instead of using proximal operator for TV regularization, we use the iterative TV solver such as PDHG.
+            @jax.jit
+            def x_update_single(x_i, Ax_i, z_i, λ_i, τ):
+                v = x_i - 1 / τ * (self.ρ * A_i.T(Ax_i - z_i - λ_i / self.ρ))
+                solver_pdhg = PDHG(
+                    f = loss.SquaredL2Loss(y=v),
+                    g = self.regularization / τ * g_i,
+                    C = C_i,
+                    tau=τ_pdhg,           # Default parameters for PDHG.
+                    sigma=σ_pdhg,           # Default parameters for PDHG.
+                    x0=x_i,
+                    maxiter=self.maxiter_pdhg,          # Fewer iterations for PDHG.
+                    itstat_options={"display": False}, # Default display period for PDHG.
+                )
+                x_updated = solver_pdhg.solve()
+                return x_updated
+            return x_update_single
+        self._x_update_fns = [_make_x_update_fn(Ai, gi, Ci, τ_pdhg, σ_pdhg) 
+                               for Ai, gi, Ci, τ_pdhg, σ_pdhg in zip(self.A_list, self.g_list, self.C_list, self.τ_pdhg_list, self.σ_pdhg_list)]
 
-    # Parallel x-update step for x on different GPUs.
-    def x_update(self, worker_index: int):
-        # x-update step.
-        grad = self.ρ * self.A_list[worker_index].T(self.Ax_list[worker_index] - self.z_list[worker_index] - self.λ_list[worker_index] / self.ρ)
-        self.x_list[worker_index] = self.g_list[worker_index].prox(self.x_list[worker_index] - 1 / self.τ * grad, self.regularization / self.τ)
+        super().__init__(**kwargs)
+    
+    # Parallel x-update step for all x on different GPUs.
+    def x_update_parallel(self):
+        """Update all x_i in parallel using JIT-compiled functions."""
+        # Launch x_i update on each GPU using JIT compilation.
+        # After the first time compilation, the x_list updates are fully parallelized.
+        x_list_new = [None] * self.N
+        for i in range(self.N):
+            x_list_new[i] = self._x_update_fns[i](self.x_list[i], self.Ax_list[i], self.z_list[i], self.λ_list[i], self.τ)
+        jax.block_until_ready(x_list_new)
+        # Update x_list with the new values (this is the side effect, done after all computations)
+        for i in range(self.N):
+            self.x_list[i] = x_list_new[i]
             
     # Parallel Ax update step for Ax on different GPUs.
     def Ax_update(self):
@@ -209,8 +256,7 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
         Ax_list = [None] * self.N
         for i in range(self.N):
             Ax_list[i] = self._A_apply_fns[i](self.x_list[i])
-        for Ax in Ax_list:
-            Ax.block_until_ready()
+        jax.block_until_ready(Ax_list)
         # Convert the Ax_list to a sharded array in order to use jax.lax.psum.
         Ax_list = jax.device_put_sharded(Ax_list, self.device_list)
         # Use jax.lax.psum to simultaneously update all the Ax on each of the GPUs.
@@ -220,7 +266,7 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
     def z_update(self):
         """Update the auxilliary indicator variable z, by using the proximal operator of the L2 ball indicator."""
         # Compute the optimal z, possibly with a scaling.
-        z = 1 / (1 + self.ρ) * (self.y_list[0] + self.ρ * self.Ax_list[0] - self.λ_list[0])
+        z = 1 / (1 + self.ρ) * (self.y + self.ρ * self.Ax_list[0] - self.λ_list[0])
         self.z_list = [jax.device_put(z, device) for device in self.device_list]
 
     def get_residual_on_device(self, device_index: int = 0):
@@ -270,17 +316,14 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
         """Determine whether the objective function can be evaluated."""
         # return all([_.has_eval for _ in self.A_list]) and all([_.has_eval for _ in self.g_list])
         return True
-    
-    # def distance(self):
-    #     return snp.linalg.norm(self.Ax_list[0] - self.y_list[0])
-    
-    # def z_norm(self):
-    #     return snp.linalg.norm(self.z_list[0])
+
+    def proximal_parameter(self) -> float:
+        return self.regularization / self.τ
 
     def _itstat_extra_fields(self):
         """Define ADMM-specific iteration statistics fields."""
-        itstat_fields = {"Prml Rsdl": "%9.3e", "Dual Rsdl": "%9.3e", "Regularization": "%9.3e", "Constraint": "%9.3e"}
-        itstat_attrib = ["norm_primal_residual()", "norm_dual_residual()", "regularization_value()", "constraint_value()"]
+        itstat_fields = {"Prml Rsdl": "%9.3e", "Dual Rsdl": "%9.3e", "Regularization": "%9.3e", "Constraint": "%9.3e", "Proximal Parameter": "%9.3e", "x difference": "%9.3e", "SNR": "%9.3e"}
+        itstat_attrib = ["norm_primal_residual()", "norm_dual_residual()", "regularization_value()", "constraint_value()", "proximal_parameter()", "x_difference()", "snr()"]
 
         return itstat_fields, itstat_attrib
 
@@ -302,9 +345,11 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
             for j in range(self.col_division_num):
                 roi_start_row, roi_end_row = i * Nx // self.row_division_num, (i + 1) * Nx // self.row_division_num  # Selected rows
                 roi_start_col, roi_end_col = j * Ny // self.col_division_num, (j + 1) * Ny // self.col_division_num  # Selected columns
-                tangle_recon = tangle_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(self.x_list[i * self.col_division_num + j])
+                tangle_recon = tangle_recon.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(jax.device_put(self.x_list[i * self.col_division_num + j], self.device_list[0]))
 
-        return metric.snr(self.ground_truth, tangle_recon)
+        snr_val = metric.snr(self.ground_truth, tangle_recon)
+        del tangle_recon  # Drop reference so the large array can be freed
+        return snr_val
 
     def regularization_value(self) -> float:
         out = 0.0
@@ -315,7 +360,9 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
         return out
 
     def constraint_value(self) -> float:
-        return 1 / 2 * snp.linalg.norm(self.z_list[0] - self.y_list[0])**2
+        # TODO: Also compute the 1/2||Ax-y||^2, instead of just 1/2||z-y||^2.
+        # return 1 / 2 * snp.linalg.norm(self.z_list[0] - self.y)**2
+        return 1 / 2 * snp.linalg.norm(self.Ax_list[0] - self.y)**2
 
     def objective(self) -> float:
         r"""Evaluate the objective function.
@@ -379,8 +426,22 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
             Norm of dual residual.
 
         """
-        dual_residual = self.ρ * self.A_list[0].T(self.z_list[0] - self.z_list_prev[0])
+        # TODO: Check if this is measured correctly.
+        dual_residual = 0
+        for i in range(self.N):
+            dual_residual = jax.device_put(dual_residual, self.device_list[i])
+            dual_residual += self.A_list[i].T(self.z_list[i] - self.z_list_prev[i])
+        dual_residual = jax.device_put(dual_residual, self.device_list[0])
         return snp.linalg.norm(dual_residual)
+
+    def x_difference(self) -> float:
+        total_change = 0
+        for i in range(self.N):
+            total_change = jax.device_put(total_change, self.device_list[i])
+            change = snp.linalg.norm(self.x_list[i] - self.x_list_prev[i]) ** 2
+            total_change += change
+        total_change = jax.device_put(total_change, self.device_list[0])
+        return total_change
 
     def step(self):
         r"""Perform a single proximal Jacobi ADMM iteration.
@@ -410,10 +471,11 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
 
         # Update the predicted sinogram \sum_{i=1}^N A_ix_i for proximal Jacobi ADMM update.
         self.Ax_update()
-        # Update each of the x_i in parallel.
-        for i in range(self.N):
-            self.x_update(i)
-        jax.block_until_ready(self.x_list)
+        # Update each of the x_i in parallel using JIT-compiled functions.
+        # for i in range(self.N):
+        #     self.x_update(i)
+        # jax.block_until_ready(self.x_list)
+        self.x_update_parallel()
         # Update the predicted sinogram \sum_{i=1}^N A_ix_i again, so that the z-update is Gauss-Seidel.
         self.Ax_update()
         # Update the auxilliary indicator variable z
@@ -441,9 +503,6 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
         # Compute the lower bound of error decrease: h(u^k,u^{k+1})
         lower_bound = dx_norm + d_lambda_norm + cross_term
 
-        # '''
-        # For test purpose, the code below is temporarily commented out.
-        # '''
         # if lower_bound < 0, double τ to ensure convergence:
         if lower_bound < 0:
             print("τ is doubled at iteration ", self.itnum)
@@ -457,12 +516,15 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
             self.Ax_list_prev = self.Ax_list_prev_prev.copy()
             self.z_list = self.z_list_prev.copy()
             self.z_list_prev = self.z_list_prev_prev.copy()
-        # '''
-        # end of test block.
-        # '''
-        elif self.itnum % 10 == 0:
+        elif self.itnum % 10 == 0 and self.tau_decrease:
             # Decrase τ after every a pre-defined number of iterations.
             self.τ = self.τ / 1.2
+
+    def save_solution(self, itnum: int):
+        """Save the solution at the current iteration."""
+        self.x_list = self.minimizer()
+        self.save_path = os.path.join(self.save_path, f"iteration_{itnum}.npy")
+        snp.save(self.save_path, self.x_list)
 
     def solve(
         self,
@@ -490,6 +552,9 @@ class ParallelSemiProxJacobiADMML2TV(Optimizer):
                     ""
                 )
             self.itstat_object.insert(self.itstat_insert_func(self))
+            # TODO: Implement saving solution during the optimization process.
+            # if self.save_period is not None and self.itnum % self.save_period == 0:
+            #     self.save_solution(self.itnum)
             if callback:
                 self.timer.stop()
                 callback(self)

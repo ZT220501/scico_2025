@@ -60,9 +60,9 @@ def noisy_sinogram(sinogram, snr_db=30, use_variance=True, save_path=None):
 """
 Create a ground truth image and projector.
 """
-Nx = 512
-Ny = 512
-Nz = 512
+Nx = 256
+Ny = 256
+Nz = 256
 
 # tangle = snp.array(create_tangle_phantom(Nx, Ny, Nz))
 tangle = create_3d_foam_phantom(im_shape=(Nz, Ny, Nx), N_sphere=100)
@@ -82,9 +82,14 @@ print("shape of tangle is: ", tangle.shape)
 print("shape of C is: ", C.shape)
 
 y = C @ tangle  # sinogram
-snr_db = int(50)
+# snr_db = int(40)
+snr_db = "inf"
 print(f"SNR of sinogram: {snr_db} dB")
-y_noisy, noise = noisy_sinogram(y, snr_db=snr_db, use_variance=True, save_path=None)
+if snr_db == "inf":
+    y_noisy = y
+    noise = snp.zeros(y.shape, dtype=y.dtype)
+else:
+    y_noisy, noise = noisy_sinogram(y, snr_db=snr_db, use_variance=True, save_path=None)
 
 r"""
 Set up problem and solver. We want to minimize the functional
@@ -123,8 +128,7 @@ gradient sub-iterations used by the ADMM solver in the
 𝛼 = 1e2  # improve problem conditioning by balancing C and D components of A
 λ = 2e0 / 𝛼  # ℓ2,1 norm regularization parameter
 ρ = 5e-3  # ADMM penalty parameter
-maxiter = 500  # number of ADMM iterations
-# maxiter = 1
+maxiter = 1000  # number of ADMM iterations
 
 regularization_type = "tv"
 print(f"Regularization type: {regularization_type}")
@@ -157,6 +161,7 @@ x0 = A_full.fbp_recon(y_noisy)
 mu, nu = ProximalADMM.estimate_parameters(A)
 print(f"mu: {mu}, nu: {nu}")
 
+print("Start of the standard PADMM reconstruction")
 solver = ProximalADMM(
     f=f,
     g=g,
@@ -167,7 +172,8 @@ solver = ProximalADMM(
     nu=nu,
     maxiter=maxiter,
     itstat_options={"display": True, "period": 50},
-    x0=x0
+    x0=x0,
+    x_gt=tangle
 )
 
 """

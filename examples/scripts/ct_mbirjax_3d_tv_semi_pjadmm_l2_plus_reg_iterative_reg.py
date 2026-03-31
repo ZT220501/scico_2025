@@ -13,9 +13,9 @@ from scico import functional, linop, loss, metric, plot
 from scico.examples import create_tangle_phantom, create_3d_foam_phantom
 from scico.linop.xray.mbirjax import XRayTransformParallel
 from scico.optimize.admm import ADMM, LinearSubproblemSolver
-from scico.optimize import ParallelSemiProxJacobiADMMIndicator
+from scico.optimize import ParallelSemiProxJacobiADMML2PlusRegIterativeReg
 from scico.util import device_info, create_roi_indices
-from scico.functional import IsotropicTVNorm, L1Norm
+from scico.functional import IsotropicTVNorm, L1Norm, L21Norm
 
 import scipy.io
 import argparse
@@ -48,7 +48,7 @@ def cleanup_memory():
 
 
 def noisy_sinogram(sinogram, snr_db=30, use_variance=True, save_path=None, seed=42):
-    """Add Poisson noise to the sinogram, so that SNR is around snr_db dB."""
+    """Add Gaussian noise to the sinogram, so that SNR is around snr_db dB."""
     # Set the seed for reproducibility.
     np.random.seed(seed)
 
@@ -105,7 +105,8 @@ to be reconstructed using FBP on each of the GPUs.
 def pjadmm_parallel_fbp_parallel_noisy_test(
     Nx=128, Ny=256, Nz=64, row_division_num=2, col_division_num=2,
     rho=1e-3, tau=0.1, regularization=1e-2, n_projection=30, maxiter=1000,
-    N_sphere=100, sinogram_snr="30", regularization_type="l1"
+    N_sphere=100, sinogram_snr="30", regularization_type="l1", maxiter_pdhg=5, tau_decrease=True,
+    τ_pdhg=2e-2, σ_pdhg=8e0
 ):
     '''
     Create a ground truth image and projector.
@@ -137,6 +138,7 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     print("Creating the full sinogram...")
     y = A_full @ x_gt
     if np.isinf(sinogram_snr):
+        print("No noise is added to the sinogram.")
         y_noisy = y
         noise = snp.zeros(y.shape, dtype=y.dtype)
         sigma = 0.0
@@ -144,20 +146,6 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
         print("Creating the noisy sinogram...")
         sinogram_snr = int(sinogram_snr)
         y_noisy, noise, sigma = noisy_sinogram(y, snr_db=sinogram_snr, use_variance=True, save_path=os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "noisy_sinogram.png"))
-
-        # Estimate the noise level, by using another measurement of the noise level.
-        y_noisy_2, noise_2, sigma_2 = noisy_sinogram(y, snr_db=sinogram_snr, use_variance=True, save_path=os.path.join("/home/zhengtan/repos/scico/examples/scripts/results", "noisy_sinogram_2.png"), seed=23411423)
-        diff = y_noisy - y_noisy_2
-        sigma_estimated = snp.linalg.norm(diff) / snp.sqrt(2*max(Nx, Ny)*n_projection*Nz)
-        noise_estimated = np.random.normal(0.0, sigma_estimated, size=y_noisy.shape).astype(np.float32)
-        print("True L2 norm is: ", snp.linalg.norm(y_noisy - y))
-        eps_estimated = snp.linalg.norm(noise_estimated)
-        print("Estimated L2 norm is: ", eps_estimated)
-
-    # # Use the true noise level to estimate the ε.
-    # eps_estimated = snp.linalg.norm(noise)
-    # print("True L2 norm is: ", snp.linalg.norm(y_noisy - y))
-    # print("The ε used is: ", eps_estimated)
 
     '''
     Set up problems and solvers for TV regularized solver, block reconstruction using proximal Jacobi ADMM.
@@ -204,11 +192,15 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
             device_idx += 1         # Update the GPU device index to put the block on.
             x0_list.append(x0_block)
     
-    # Define the TV regularizer for each ROI in the later block reconstruction.
+    # Define the TV and L1 regularizers for each ROI in the later block reconstruction.
+    # Notice that here the definition is different from the one in the ParallelSemiProxJacobiADMML2PlusReg solver, since we split 
+    # TV regularization into the finite difference D and the L2,1 norm.
     if regularization_type == "tv":
-        g_list = [IsotropicTVNorm(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]
+        g_list = [L21Norm() for i in range(len(A_list))]
+        C_list = [linop.FiniteDifference(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype, append=0) for i in range(len(A_list))]
     elif regularization_type == "l1":
         g_list = [L1Norm() for i in range(len(A_list))]
+        C_list = [linop.Identity(input_shape=A_list[i].input_shape, input_dtype=A_list[i].input_dtype) for i in range(len(A_list))]
     else:
         raise ValueError(f"Regularization type {regularization_type} not supported.")
         exit()
@@ -217,7 +209,6 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     ρ = rho
     τ = tau
     regularization = regularization
-    ε = eps_estimated
     
     γ = 1  # Damping parameter in the proximal Jacobi ADMM solver, in the update of the dual variable.
     λ = snp.zeros(A_list[0].output_shape, dtype=A_list[0].output_dtype)  # Dual variable
@@ -225,19 +216,19 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     α = 0.8 if correction else None      # Relaxation parameter in the proximal Jacobi ADMM solver, in the correction step. Currently not used.
     maxiter = maxiter  # number of decentralized ADMM iterations
 
-    print(f"ρ: {ρ}, τ: {τ}, regularization: {regularization}, ε: {ε}, γ: {γ}, correction: {correction}, α: {α}, maxiter: {maxiter}, regularization_type: {regularization_type}")
+    print(f"ρ: {ρ}, τ: {τ}, regularization: {regularization}, γ: {γ}, correction: {correction}, α: {α}, maxiter: {maxiter}, regularization_type: {regularization_type}, maxiter_pdhg: {maxiter_pdhg}, τ_pdhg: {τ_pdhg}, σ_pdhg: {σ_pdhg}")
 
     test_mode = True
 
-    tv_solver = ParallelSemiProxJacobiADMMIndicator(
+    tv_solver = ParallelSemiProxJacobiADMML2PlusRegIterativeReg(
         A_list=A_list,
         g_list=g_list,
+        C_list=C_list,
         ρ=ρ,
         y=y_noisy,          # Note we only have the noisy sinogram available instead of the full sinogram.
         τ=τ,
         γ=γ,
         regularization = regularization,
-        ε=ε,
         λ=λ,
         x0_list=x0_list,
         display_period = 1,
@@ -249,6 +240,10 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
         col_division_num = col_division_num,
         device_list = gpu_devices,
         num_processes = len(gpu_devices),
+        maxiter_pdhg = maxiter_pdhg,
+        tau_decrease = tau_decrease,
+        τ_pdhg = τ_pdhg,
+        σ_pdhg = σ_pdhg,
         maxiter = maxiter,
         itstat_options={"display": True, "period": 10}
     )
@@ -298,32 +293,26 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     fig.show()
 
     # Save the figure
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/semi_pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_indicator_estimated_eps')
-    # results_dir = os.path.join(os.path.dirname(__file__), f'results/semi_pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_indicator_estimated_eps_no_tau_decrease')
-    # results_dir = os.path.join(os.path.dirname(__file__), f'results/semi_pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_indicator_estimated_eps_gradually_tau_decrease')
-    # results_dir = os.path.join(os.path.dirname(__file__), f'results/semi_pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_indicator_estimated_eps_halve_tau_50_iterations')
-    # results_dir = os.path.join(os.path.dirname(__file__), f'results/semi_pjadmm_parameter_tuning/semi_pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_indicator_estimated_eps')
+    if tau_decrease:
+        results_dir = os.path.join(os.path.dirname(__file__), f'results/semi_pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_l2_plus_reg_iterative_reg')
+    else:
+        results_dir = os.path.join(os.path.dirname(__file__), f'results/semi_pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_l2_plus_reg_iterative_reg_no_tau_decrease')
     os.makedirs(results_dir, exist_ok=True)
-    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_semi_pjadmm_indicator_estimated_eps_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_ε{eps_estimated}_gamma{γ}_maxiter{maxiter}.png')
-    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_semi_pjadmm_indicator_estimated_eps_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_ε{eps_estimated}_gamma{γ}_maxiter{maxiter}_no_tau_decrease.png')
-    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_semi_pjadmm_indicator_estimated_eps_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_ε{eps_estimated}_gamma{γ}_maxiter{maxiter}_gradually_tau_decrease.png')
-    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_semi_pjadmm_indicator_estimated_eps_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_ε{eps_estimated}_gamma{γ}_maxiter{maxiter}_more_tau_decrease.png')
-    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_semi_pjadmm_indicator_estimated_eps_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_ε{eps_estimated}_gamma{γ}_maxiter{maxiter}_halve_tau_50_iterations.png')
-    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_semi_pjadmm_indicator_estimated_eps_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_ε{eps_estimated}_gamma{γ}_maxiter{maxiter}.png')
+    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_semi_pjadmm_l2_plus_reg_iterative_reg_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_gamma{γ}_maxiter{maxiter}_maxiter_pdhg{maxiter_pdhg}_τ_pdhg{τ_pdhg}_σ_pdhg{σ_pdhg}.png')
     fig.savefig(save_path)   # save the figure to file
 
     # Save the result to a txt file
     results_file = os.path.join(results_dir, f'results.txt')
     with open(results_file, 'a') as f:
-        f.write(f"Test configuration: Nx: {Nx}, Ny: {Ny}, Nz: {Nz}, row_division_num: {row_division_num}, col_division_num: {col_division_num}, rho: {rho}, tau: {tau}, regularization: {regularization}, eps: {eps_estimated}, n_projection: {n_projection}, maxiter: {maxiter}, N_sphere: {N_sphere}, sinogram_snr: {sinogram_snr}, regularization_type: {regularization_type}\n")
+        f.write(f"Test configuration: Nx: {Nx}, Ny: {Ny}, Nz: {Nz}, row_division_num: {row_division_num}, col_division_num: {col_division_num}, rho: {rho}, tau: {tau}, regularization: {regularization}, n_projection: {n_projection}, maxiter: {maxiter}, N_sphere: {N_sphere}, sinogram_snr: {sinogram_snr}, regularization_type: {regularization_type}, maxiter_pdhg: {maxiter_pdhg}, τ_pdhg: {τ_pdhg}, σ_pdhg: {σ_pdhg}\n")
         f.write(f"Final SNR: {round(metric.snr(x_gt, x_gt_recon), 2)} (dB), Final MAE: {round(metric.mae(x_gt, x_gt_recon), 3)}\n")
         f.write("---------------------------------------------------------\n")
     print(f"Final SNR: {round(metric.snr(x_gt, x_gt_recon), 2)} (dB), Final MAE: {round(metric.mae(x_gt, x_gt_recon), 3)}")
     
-    # Save the reconstruction result for replotting
-    raw_data_dir = os.path.join(results_dir, "raw_data")
-    os.makedirs(raw_data_dir, exist_ok=True)
-    snp.save(os.path.join(raw_data_dir, f"x_gt_recon_parallel_noisy_{n_projection}views_snr{sinogram_snr}_ρ{ρ}_τ{τ}_regularization{regularization}_ε{eps_estimated}_gamma{γ}_maxiter{maxiter}.npy"), x_gt_recon)
+    # # Save the reconstruction result for replotting
+    # raw_data_dir = os.path.join(results_dir, "raw_data")
+    # os.makedirs(raw_data_dir, exist_ok=True)
+    # snp.save(os.path.join(raw_data_dir, f"x_gt_recon_parallel_noisy_{n_projection}views_snr{sinogram_snr}_ρ{ρ}_τ{τ}_regularization{regularization}_gamma{γ}_maxiter{maxiter}.npy"), x_gt_recon)
     
     return x_gt_recon
 
@@ -335,7 +324,7 @@ if __name__ == "__main__":
 
     # Set up argument parser
     parser = argparse.ArgumentParser(
-        description="3D TV-Regularized Sparse-View CT Reconstruction with Proximal Jacobi Overlapped ADMM using MBIRJAX",
+        description="3D TV-Regularized Sparse-View CT Reconstruction with Proximal Jacobi L2+TV ADMM using MBIRJAX",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -366,6 +355,14 @@ if __name__ == "__main__":
                        help='SNR of the sinogram in dB (default: 30). Use "inf" for no noise.')
     parser.add_argument('--regularization_type', type=str, default="tv",
                        help='Regularization type (default: tv)')
+    parser.add_argument('--maxiter_pdhg', type=int, default=5,
+                       help='Number of iterations for PDHG (default: 5)')
+    parser.add_argument('--tau_decrease', type=bool, default=True,
+                       help='Whether to use tau decrease (default: True)')
+    parser.add_argument('--τ_pdhg', type=float, default=2e-2,
+                       help='Proximal weight for PDHG (default: 2e-2)')
+    parser.add_argument('--σ_pdhg', type=float, default=8e0,
+                       help='Dual weight for PDHG (default: 8e0)')
     # Parse arguments
     args = parser.parse_args()
     
@@ -388,7 +385,7 @@ if __name__ == "__main__":
     
     # Display configuration
     print("="*100)
-    print("3D TV-Regularized Sparse-View CT Reconstruction (Proximal Jacobi Overlapped ADMM Solver) using MBIRJAX")
+    print("3D TV-Regularized Sparse-View CT Reconstruction (Proximal Jacobi L2+TV ADMM Solver) using MBIRJAX, iterative regularization")
     print("="*100)
     print(f"Configuration:")
     print(f"  Image dimensions: {args.Nx}x{args.Ny}x{args.Nz}")
@@ -402,9 +399,8 @@ if __name__ == "__main__":
     
     # Run the test
     print("\n" + "="*80)
-    print("TEST: Block Proximal Jacobi ADMM test")
+    print("TEST: Block Proximal semi-Jacobi ADMM with iterative regularization test")
     print("="*80)
-    
 
     test_results = pjadmm_parallel_fbp_parallel_noisy_test(
         Nx=args.Nx,
@@ -419,7 +415,11 @@ if __name__ == "__main__":
         maxiter=args.maxiter,
         N_sphere=args.N_sphere,
         sinogram_snr=args.sinogram_snr,
-        regularization_type=args.regularization_type
+        regularization_type=args.regularization_type,
+        maxiter_pdhg=args.maxiter_pdhg,
+        tau_decrease=args.tau_decrease,
+        τ_pdhg=args.τ_pdhg,
+        σ_pdhg=args.σ_pdhg
     )
     print("\n✅ Test completed!")
     print("="*80)

@@ -13,7 +13,7 @@ from scico import functional, linop, loss, metric, plot
 from scico.examples import create_tangle_phantom, create_3d_foam_phantom
 from scico.linop.xray.mbirjax import XRayTransformParallel
 from scico.optimize.admm import ADMM, LinearSubproblemSolver
-from scico.optimize import ParallelSemiProxJacobiADMML2TV
+from scico.optimize import ParallelSemiProxJacobiADMML2PlusReg
 from scico.util import device_info, create_roi_indices
 from scico.functional import IsotropicTVNorm, L1Norm
 
@@ -48,7 +48,7 @@ def cleanup_memory():
 
 
 def noisy_sinogram(sinogram, snr_db=30, use_variance=True, save_path=None, seed=42):
-    """Add Poisson noise to the sinogram, so that SNR is around snr_db dB."""
+    """Add Gaussian noise to the sinogram, so that SNR is around snr_db dB."""
     # Set the seed for reproducibility.
     np.random.seed(seed)
 
@@ -137,6 +137,7 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     print("Creating the full sinogram...")
     y = A_full @ x_gt
     if np.isinf(sinogram_snr):
+        print("No noise is added to the sinogram.")
         y_noisy = y
         noise = snp.zeros(y.shape, dtype=y.dtype)
         sigma = 0.0
@@ -214,7 +215,7 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
 
     test_mode = True
 
-    tv_solver = ParallelSemiProxJacobiADMML2TV(
+    tv_solver = ParallelSemiProxJacobiADMML2PlusReg(
         A_list=A_list,
         g_list=g_list,
         ρ=ρ,
@@ -282,9 +283,15 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
     fig.show()
 
     # Save the figure
-    results_dir = os.path.join(os.path.dirname(__file__), f'results/semi_pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_l2tv')
+    # results_dir = os.path.join(os.path.dirname(__file__), f'results/semi_pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_l2_plus_reg')
+    # results_dir = os.path.join(os.path.dirname(__file__), f'results/semi_pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_l2_plus_reg_no_tau_decrease')
+    # results_dir = os.path.join(os.path.dirname(__file__), f'results/semi_pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_l2_plus_reg_parameter_tuning')
+    results_dir = os.path.join(os.path.dirname(__file__), f'results/semi_pjadmm_parallel_{regularization_type}_fbp_noisy_sinogram_snr{sinogram_snr}_{row_division_num}_{col_division_num}_N_sphere{N_sphere}_l2_plus_reg_corrected_residuals')
     os.makedirs(results_dir, exist_ok=True)
-    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_semi_pjadmm_l2tv_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_gamma{γ}_maxiter{maxiter}.png')
+    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_semi_pjadmm_l2_plus_reg_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_gamma{γ}_maxiter{maxiter}.png')
+    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_semi_pjadmm_l2_plus_reg_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_gamma{γ}_maxiter{maxiter}_no_tau_decrease.png')
+    # save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_semi_pjadmm_l2_plus_reg_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_gamma{γ}_maxiter{maxiter}_parameter_tuning.png')
+    save_path = os.path.join(results_dir, f'ct_mbirjax_3d_{regularization_type}_semi_pjadmm_l2_plus_reg_parallel_fbp_recon_noisy_{n_projection}views_{Nx}x{Ny}x{Nz}_foam_ρ{ρ}_τ{τ}_regularization{regularization}_gamma{γ}_maxiter{maxiter}_corrected_residuals.png')
     fig.savefig(save_path)   # save the figure to file
 
     # Save the result to a txt file
@@ -295,10 +302,10 @@ def pjadmm_parallel_fbp_parallel_noisy_test(
         f.write("---------------------------------------------------------\n")
     print(f"Final SNR: {round(metric.snr(x_gt, x_gt_recon), 2)} (dB), Final MAE: {round(metric.mae(x_gt, x_gt_recon), 3)}")
     
-    # Save the reconstruction result for replotting
-    raw_data_dir = os.path.join(results_dir, "raw_data")
-    os.makedirs(raw_data_dir, exist_ok=True)
-    snp.save(os.path.join(raw_data_dir, f"x_gt_recon_parallel_noisy_{n_projection}views_snr{sinogram_snr}_ρ{ρ}_τ{τ}_regularization{regularization}_gamma{γ}_maxiter{maxiter}.npy"), x_gt_recon)
+    # # Save the reconstruction result for replotting
+    # raw_data_dir = os.path.join(results_dir, "raw_data")
+    # os.makedirs(raw_data_dir, exist_ok=True)
+    # snp.save(os.path.join(raw_data_dir, f"x_gt_recon_parallel_noisy_{n_projection}views_snr{sinogram_snr}_ρ{ρ}_τ{τ}_regularization{regularization}_gamma{γ}_maxiter{maxiter}.npy"), x_gt_recon)
     
     return x_gt_recon
 

@@ -19,7 +19,7 @@ import jax
 
 import scico.numpy as snp
 from scico.loss import Loss, SquaredL2Loss
-from scico.typing import Shape
+from scico.typing import DType, Shape
 
 from .._diag import Diagonal, Identity
 from .._linop import LinearOperator
@@ -47,6 +47,8 @@ class XRayTransformParallel(LinearOperator):
         partial_reconstruction: bool = False,
         roi_indices: Optional[snp.Array] = None,
         roi_recon_shape: Optional[Shape] = None,
+        input_dtype: DType = np.float32,
+        output_dtype: DType = np.float32,
         **kwargs,
     ):
         """
@@ -97,8 +99,8 @@ class XRayTransformParallel(LinearOperator):
         super().__init__(
             input_shape=input_shape,
             output_shape=output_shape,
-            input_dtype=np.float32,
-            output_dtype=np.float32,
+            input_dtype=input_dtype,
+            output_dtype=output_dtype,
             eval_fn=self.project,
             adj_fn=self.back_project,
             jit=jit,
