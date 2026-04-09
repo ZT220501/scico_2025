@@ -1,0 +1,620 @@
+# -*- coding: utf-8 -*-
+# Copyright (C) 2020-2025 by SCICO Developers
+# All rights reserved. BSD 3-clause License.
+# This file is part of the SCICO package. Details of the copyright and
+# user license can be found in the 'LICENSE' file distributed with the
+# package.
+
+"""Parallel Proximal Jacobi ADMM solver."""
+
+# Needed to annotate a class method that returns the encapsulating class;
+# see https://www.python.org/dev/peps/pep-0563/
+from __future__ import annotations
+
+from typing import List, Optional, Tuple, Union, Callable
+import logging
+import os
+from datetime import datetime
+from functools import partial
+import numpy as np
+
+import scico.numpy as snp
+from scico.functional import Functional
+from scico.linop import LinearOperator
+from scico.numpy import Array, BlockArray
+from scico.numpy.linalg import norm
+from scico.optimize.admm import ADMM
+from scico.optimize import PDHG
+from scico import functional, linop, loss, metric, plot
+from scico.util import Timer
+import jax
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.experimental import multihost_utils
+import multiprocessing, threading
+import time
+
+from ._admmaux import (
+    FBlockCircularConvolveSolver,
+    G0BlockCircularConvolveSolver,
+    GenericSubproblemSolver,
+    LinearSubproblemSolver,
+    MatrixSubproblemSolver,
+    SubproblemSolver,
+)
+from ._common import Optimizer
+
+
+# TODO: Finish writing the actual multi-GPU version of proximal Jacobi ADMM.
+# Think more about where/how to store the sinogram acrossGPUs.
+class ParallelSemiProxJacobiADMML2PlusRegIterativeRegEstimatedPDHGMultinode(Optimizer):
+    r"""Proximal Jacobi Alternating Direction Method of Multipliers (ADMM) algorithm.
+    For reference, see https://link.springer.com/article/10.1007/s10915-016-0318-2.
+
+    This is a parallelized version of the ProxJacobiADMM algorithm using multiprocessing.
+    We assume that the block-wise PJADMM is executed on different GPUs, and for now
+    the sum_{i=1}^N A_ix_i and the dual variable λ are stored on the main CPU.
+
+    TODO: Write the documentation more comprehensively.
+
+    """
+    def __init__(
+        self,
+        A_list: List[LinearOperator],
+        g_list: List[Functional],
+        C_list: List[LinearOperator],
+        ρ: float,
+        y: Array,
+        τ: float,
+        γ: float,
+        regularization: float,
+        λ: Optional[Array] = None,
+        x0_list: Optional[List[Union[Array, BlockArray]]] = None,
+        display_period: int = 5,
+        with_correction: bool = False,
+        α: float = None,
+        test_mode: bool = False,
+        ground_truth: Optional[Array] = None,
+        full_reconstruction_shape: Optional[Tuple[int, int, int]] = None,
+        row_division_num: int = 4,
+        col_division_num: int = 8,
+        device_list: List[str] = None,
+        num_processes: int = None,
+        global_block_indices: Optional[List[int]] = None,
+        maxiter_pdhg: int = 5,
+        tau_decrease: bool = True,
+        **kwargs,
+    ):
+        r"""Initialize an :class:`ProxJacobiADMM` object.
+
+        Args:
+            A_list: List of :math:`A_i` operators, represents the partial
+                forward sinogram projection operators of each block.
+            g_list: List of :math:`g_i` functionals. Must be same length
+                 as :code:`D_list` and :code:`rho_list`.
+            D_list: List of :math:`C_i` operators.
+            rho_list: List of :math:`\rho_i` penalty parameters.
+                Must be same length as :code:`D_list` and :code:`g_list`.
+            alpha: Relaxation parameter. No relaxation for default 1.0.
+            b: Array that represents the ground truth full sinogram.
+            x0: Initial value for :math:`\mb{x}`. If ``None``, defaults
+                to an array of zeros.
+            subproblem_solver: Solver for :math:`\mb{x}`-update step.
+                Defaults to ``None``, which implies use of an instance of
+                :class:`GenericSubproblemSolver`.
+            **kwargs: Additional optional parameters handled by
+                initializer of base class :class:`.Optimizer`.
+        """
+        # Currently we assume each process owns a subset of blocks and all
+        # processes participate in the same JAX distributed job.
+        if num_processes is None:
+            raise ValueError("num_processes is required.")
+        if device_list is None:
+            raise ValueError("device_list is required.")
+        self.num_processes = num_processes
+        self.device_list = device_list
+        self.process_id = jax.process_index()
+        self.process_count = jax.process_count()
+        if self.num_processes != self.process_count:
+            raise ValueError(
+                f"num_processes={self.num_processes} does not match jax.process_count()={self.process_count}."
+            )
+        if len(self.device_list) == 0:
+            raise ValueError("device_list must contain at least one local device.")
+
+        self.N = len(A_list)
+        if len(g_list) != self.N:
+            raise ValueError(f"len(g_list)={len(g_list)} not equal to len(A_list)={self.N}.")
+        if len(x0_list) != self.N:
+            raise ValueError(f"len(x0_list)={len(x0_list)} not equal to len(A_list)={self.N}.")
+        if self.N != len(self.device_list):
+            raise ValueError(f"N={self.N} is not equal to len(device_list)={len(self.device_list)}.")
+        self.total_block_count = row_division_num * col_division_num
+        if global_block_indices is None:
+            block_offset = self.process_id * self.N
+            global_block_indices = list(range(block_offset, block_offset + self.N))
+        if len(global_block_indices) != self.N:
+            raise ValueError(
+                f"len(global_block_indices)={len(global_block_indices)} not equal to local block count={self.N}."
+            )
+        if any(block_idx < 0 or block_idx >= self.total_block_count for block_idx in global_block_indices):
+            raise ValueError("global_block_indices contains an out-of-range block index.")
+        self.global_block_indices = list(global_block_indices)
+        
+        if not with_correction and α is not None:
+            raise ValueError("alpha is only used when with_correction is True.")
+        if with_correction and α is None:
+            self.α = 1 - snp.sqrt(self.N / (self.N + 1))
+        else:
+            self.α: float = α
+
+        if test_mode and ground_truth is None:
+            raise ValueError("ground_truth is required in test mode.")
+        if not test_mode and ground_truth is not None:
+            raise ValueError("ground_truth is only used in test mode.")
+        self.test_mode: bool = test_mode
+        self.ground_truth: Optional[Array] = ground_truth
+        self.full_reconstruction_shape: Optional[Tuple[int, int, int]] = (
+            tuple(full_reconstruction_shape) if full_reconstruction_shape is not None else None
+        )
+
+        self.A_list: List[LinearOperator] = A_list      # List of partial forward sinogram projection operators typically.
+        self.g_list: List[Functional] = g_list          # List of outer level regularizers typically (eg. L1; L2,1).
+        self.C_list: List[LinearOperator] = C_list      # List of inner level regularization operators typically (eg. finite difference; identity).
+
+        self.ρ: float = ρ                               # ADMM penalty parameter.
+        self.y = jax.device_put(y, self.device_list[0])  # Ground truth full sinogram on the first local GPU.
+        self.γ: float = γ                                # Damping parameter.
+        self.τ: float = τ                                # Proximal weight.
+        self.regularization: float = regularization      # Regularization weight.
+        self.display_period: int = display_period        # Display period for the ADMM solver.
+        self.with_correction: bool = with_correction    # Whether to use the correction term.
+
+        self.maxiter_pdhg: int = maxiter_pdhg            # Number of iterations for PDHG.
+        self.τ_pdhg_list: List[float] = []
+        self.σ_pdhg_list: List[float] = []
+        for C in self.C_list:
+            # Estimate the τ and σ parameters for PDHG for each subproblem, using the default estimation parameters.
+            τ_pdhg, σ_pdhg = PDHG.estimate_parameters(C)
+            self.τ_pdhg_list.append(τ_pdhg)
+            self.σ_pdhg_list.append(σ_pdhg)
+
+        self.tau_decrease: bool = tau_decrease            # Whether to use tau decrease in the PJADMM; here τ is the ADMM proximal weight.
+
+        # Initialize the dual variable λ, and store a local replica on each GPU.
+        if λ is None:
+            self.λ_list = [jax.device_put(snp.zeros(A_list[0].output_shape, dtype=A_list[0].output_dtype), device) for device in self.device_list]
+        else:
+            self.λ_list = [jax.device_put(λ, device) for device in self.device_list]
+        self.λ_list_prev = self.λ_list.copy()
+        self.λ_list_prev_prev = self.λ_list_prev.copy()
+
+        # Cut the full image x into blocks x_i, and store each block x_i on each of the GPUs.
+        if x0_list is None:
+            input_shape = A_list[0].input_shape
+            dtype = A_list[0].input_dtype
+            self.x_list = [snp.zeros(input_shape, dtype=dtype) for _ in range(self.N)]
+        else:
+            self.x_list = x0_list
+        # Manually put the x_list elements on the corresponding GPUs.
+        self.x_list = [jax.device_put(x, device) for x, device in zip(self.x_list, self.device_list)]
+        self.x_list_prev = self.x_list.copy()
+        self.x_list_prev_prev = self.x_list.copy()
+
+        # Auxiliary functions for the parallelization of the Ax update.
+        def _make_A_apply_fn(A_i):
+            @jax.jit
+            def A_apply_single(x_i):
+                return A_i(x_i)
+            return A_apply_single
+        self._A_apply_fns = [_make_A_apply_fn(Ai) for Ai in self.A_list]
+
+        # Initialize global variable Ax = \sum_i A_i(x_i) across all local
+        # devices and all processes. Each process stores local replicas.
+        Ax = self._compute_global_ax()
+        self.Ax_list = [jax.device_put(Ax, device) for device in self.device_list]
+        self.Ax_list_prev = self.Ax_list.copy()
+        self.Ax_list_prev_prev = self.Ax_list_prev.copy()
+        
+        # Initialize the auxiliary indicator variable z, and store it on each of the GPUs.
+        self.z_list = [jax.device_put(self.Ax_list[0], device) for device in self.device_list]
+        self.z_list_prev = self.z_list.copy()
+        self.z_list_prev_prev = self.z_list_prev.copy()
+
+        self.row_division_num: int = row_division_num
+        self.col_division_num: int = col_division_num
+
+        # Auxiliary functions for the parallelization of the x update.
+        # These are pure functions (no side effects) that can be JIT-compiled.
+        def _make_x_update_fn(A_i, g_i, C_i, τ_pdhg, σ_pdhg):
+            # Instead of using proximal operator for TV regularization, we use the iterative TV solver such as PDHG.
+            @jax.jit
+            def x_update_single(x_i, Ax_i, z_i, λ_i, τ):
+                v = x_i - 1 / τ * (self.ρ * A_i.T(Ax_i - z_i - λ_i / self.ρ))
+                solver_pdhg = PDHG(
+                    f = loss.SquaredL2Loss(y=v),
+                    g = self.regularization / τ * g_i,
+                    C = C_i,
+                    tau=τ_pdhg,           # Default parameters for PDHG.
+                    sigma=σ_pdhg,           # Default parameters for PDHG.
+                    x0=x_i,
+                    maxiter=self.maxiter_pdhg,          # Fewer iterations for PDHG.
+                    itstat_options={"display": False}, # Default display period for PDHG.
+                )
+                x_updated = solver_pdhg.solve()
+                return x_updated
+            return x_update_single
+        self._x_update_fns = [_make_x_update_fn(Ai, gi, Ci, τ_pdhg, σ_pdhg) 
+                               for Ai, gi, Ci, τ_pdhg, σ_pdhg in zip(self.A_list, self.g_list, self.C_list, self.τ_pdhg_list, self.σ_pdhg_list)]
+
+        super().__init__(**kwargs)
+
+    def _global_sum(self, value: Array) -> Array:
+        """Sum a same-shaped array across all JAX processes."""
+        gathered = multihost_utils.process_allgather(value)
+        return snp.sum(gathered, axis=0)
+
+    def _local_ax_sum(self) -> Array:
+        """Compute the local sum of A_i x_i on this process."""
+        local_sum = jax.device_put(
+            snp.zeros(self.A_list[0].output_shape, dtype=self.A_list[0].output_dtype),
+            self.device_list[0],
+        )
+        for i in range(self.N):
+            contrib = self._A_apply_fns[i](self.x_list[i])
+            local_sum = local_sum + jax.device_put(contrib, self.device_list[0])
+        return jax.block_until_ready(local_sum)
+
+    def _compute_global_ax(self) -> Array:
+        """Compute the full Ax sum across every process."""
+        local_sum = self._local_ax_sum()
+        return self._global_sum(local_sum)
+
+    def _assemble_global_volume_from_blocks(self, block_arrays: List[Array]) -> Array:
+        """Assemble a full volume from block arrays ordered by global block id."""
+        if self.ground_truth is not None:
+            reconstruction_shape = self.ground_truth.shape
+        elif self.full_reconstruction_shape is not None:
+            reconstruction_shape = self.full_reconstruction_shape
+        else:
+            raise ValueError(
+                "ground_truth or full_reconstruction_shape is required to assemble the full reconstruction."
+            )
+        Nz, Ny, Nx = reconstruction_shape
+        volume = snp.zeros(reconstruction_shape)
+        for block_idx, block in enumerate(block_arrays):
+            row_block = block_idx // self.col_division_num
+            col_block = block_idx % self.col_division_num
+            roi_start_row = row_block * Nx // self.row_division_num
+            roi_end_row = (row_block + 1) * Nx // self.row_division_num
+            roi_start_col = col_block * Ny // self.col_division_num
+            roi_end_col = (col_block + 1) * Ny // self.col_division_num
+            volume = volume.at[:, roi_start_col:roi_end_col, roi_start_row:roi_end_row].set(block)
+        return volume
+
+    def _gather_global_blocks(self) -> List[Array]:
+        """Gather local reconstruction blocks from every process."""
+        local_blocks = snp.stack([jax.device_get(x) for x in self.x_list], axis=0)
+        local_indices = np.asarray(self.global_block_indices, dtype=np.int32)
+        gathered_blocks = multihost_utils.process_allgather(local_blocks)
+        gathered_indices = multihost_utils.process_allgather(local_indices)
+        flat_blocks = gathered_blocks.reshape((-1,) + local_blocks.shape[1:])
+        flat_indices = gathered_indices.reshape(-1)
+        ordered_blocks = [None] * self.total_block_count
+        for block, block_idx in zip(flat_blocks, flat_indices):
+            ordered_blocks[int(block_idx)] = block
+        if any(block is None for block in ordered_blocks):
+            raise ValueError("Not all global reconstruction blocks were gathered.")
+        return ordered_blocks
+
+    # Parallel x-update step for all x on different GPUs.
+    def x_update_parallel(self):
+        """Update all x_i in parallel using JIT-compiled functions."""
+        # Launch x_i update on each GPU using JIT compilation.
+        # After the first time compilation, the x_list updates are fully parallelized.
+        x_list_new = [None] * self.N
+        for i in range(self.N):
+            x_list_new[i] = self._x_update_fns[i](self.x_list[i], self.Ax_list[i], self.z_list[i], self.λ_list[i], self.τ)
+        jax.block_until_ready(x_list_new)
+        # Update x_list with the new values (this is the side effect, done after all computations)
+        for i in range(self.N):
+            self.x_list[i] = x_list_new[i]
+            
+    # Parallel Ax update step for Ax on different GPUs.
+    def Ax_update(self):
+        """Update the predicted sinogram, by summing over A_ix_i across all GPUs."""
+        global_ax = self._compute_global_ax()
+        self.Ax_list = [jax.device_put(global_ax, device) for device in self.device_list]
+
+    # Parallel z-update step for z on different GPUs.
+    def z_update(self):
+        """Update the auxilliary indicator variable z, by using the proximal operator of the L2 ball indicator."""
+        # Compute the optimal z, possibly with a scaling.
+        z = 1 / (1 + self.ρ) * (self.y + self.ρ * self.Ax_list[0] - self.λ_list[0])
+        self.z_list = [jax.device_put(z, device) for device in self.device_list]
+
+    def get_residual_on_device(self, device_index: int = 0):
+        """Get the residual value from a specific GPU device.
+        
+        Args:
+            device_index: Index of the device in device_list (default: 0)
+            
+        Returns:
+            Residual array on the specified device
+        """
+        if device_index >= len(self.device_list):
+            raise ValueError(f"device_index {device_index} out of range for {len(self.device_list)} devices")
+        return self.res_gpu_list[device_index]
+
+    def get_residual_sum_on_device(self, device_index: int = 0):
+        """Get the sum A_list[i](x_list[i]) for i in range(N) on a specific GPU device.
+        
+        Args:
+            device_index: Index of the device in device_list (default: 0)
+            
+        Returns:
+            Sum of A_list[i](x_list[i]) on the specified device
+        """
+        if device_index >= len(self.device_list):
+            raise ValueError(f"device_index {device_index} out of range for {len(self.device_list)} devices")
+        return self.res_gpu_list[device_index] + self.y
+
+    def _working_vars_finite(self) -> bool:
+        """Determine where ``NaN`` of ``Inf`` encountered in solve.
+
+        Return ``False`` if a ``NaN`` or ``Inf`` value is encountered in
+        a solver working variable.
+        """
+        for v in self.x_list + self.z_list + self.λ_list:
+            if not snp.all(snp.isfinite(v)):
+                return False
+        return True
+
+    def _objective_evaluatable(self):
+        """Determine whether the objective function can be evaluated."""
+        # return all([_.has_eval for _ in self.A_list]) and all([_.has_eval for _ in self.g_list])
+        return True
+
+    def proximal_parameter(self) -> float:
+        return self.regularization / self.τ
+
+    def _itstat_extra_fields(self):
+        """Define ADMM-specific iteration statistics fields."""
+        itstat_fields = {"Prml Rsdl": "%9.3e", "Dual Rsdl": "%9.3e", "Regularization": "%9.3e", "Constraint": "%9.3e", "Proximal Parameter": "%9.3e", "x difference": "%9.3e", "SNR": "%9.3e"}
+        itstat_attrib = ["norm_primal_residual()", "norm_dual_residual()", "regularization_value()", "constraint_value()", "proximal_parameter()", "x_difference()", "snr()"]
+
+        return itstat_fields, itstat_attrib
+
+    def _state_variable_names(self) -> List[str]:
+        # While x is in the most abstract sense not part of the algorithm
+        # state, it does form part of the state in pratice due to its use
+        # as an initializer for iterative solvers for the x step of the
+        # ADMM algorithm.
+        return ["x", "z_list", "z_list_old", "u_list"]
+
+    def minimizer(self) -> Union[Array, BlockArray]:
+        return self.x_list
+
+    def snr(self) -> float:
+        if self.ground_truth is None:
+            return float("nan")
+        ordered_blocks = self._gather_global_blocks()
+        tangle_recon = self._assemble_global_volume_from_blocks(ordered_blocks)
+        snr_val = metric.snr(self.ground_truth, tangle_recon)
+        return snr_val
+
+    def regularization_value(self) -> float:
+        out = 0.0
+        for i in range(self.N):
+            out = jax.device_put(out, self.device_list[i])
+            out += self.regularization * self.g_list[i](self.x_list[i])
+        out = jax.device_put(out, self.device_list[0])
+        return self._global_sum(out)
+
+    def constraint_value(self) -> float:
+        # TODO: Also compute the 1/2||Ax-y||^2, instead of just 1/2||z-y||^2.
+        # return 1 / 2 * snp.linalg.norm(self.z_list[0] - self.y)**2
+        return 1 / 2 * snp.linalg.norm(self.Ax_list[0] - self.y)**2
+
+    def objective(self) -> float:
+        r"""Evaluate the objective function.
+
+        Evaluate the objective function
+
+        .. math::
+            f(\mb{x}) + \sum_{i=1}^N g_i(\mb{z}_i) \;.
+
+        Note that this form is cheaper to compute, but may have very poor
+        accuracy compared with the "true" objective function
+
+        .. math::
+            f(\mb{x}) + \sum_{i=1}^N g_i(C_i \mb{x}) \;.
+
+        when the primal residual is large.
+
+        Args:
+            x: Point at which to evaluate objective function. If ``None``,
+                the objective is  evaluated at the current iterate
+                :code:`self.x`.
+            z_list: Point at which to evaluate objective function. If
+                ``None``, the objective is evaluated at the current iterate
+                :code:`self.z_list`.
+
+        Returns:
+            Value of the objective function.
+        """
+        return self.regularization_value() + self.constraint_value()
+
+    def norm_primal_residual(self, x_list: Optional[Union[Array, BlockArray]] = None) -> float:
+        r"""Compute the :math:`\ell_2` norm of the primal residual.
+
+        Compute the :math:`\ell_2` norm of the primal residual
+
+        .. math::
+            \left( \sum_{i=1}^N \rho_i \left\| C_i \mb{x} -
+            \mb{z}_i^{(k)} \right\|_2^2\right)^{1/2} \;.
+
+        Args:
+            x: Point at which to evaluate primal residual. If ``None``,
+                the primal residual is evaluated at the current iterate
+                :code:`self.x`.
+
+        Returns:
+            Norm of primal residual.
+        """        
+        return snp.linalg.norm(self.Ax_list[0] - self.z_list[0])
+
+    # This is the dual residual formulation for the indicator problem.
+    def norm_dual_residual(self) -> float:
+        r"""Compute the :math:`\ell_2` norm of the dual residual.
+
+        Compute the :math:`\ell_2` norm of the dual residual
+
+        .. math::
+            \left\| \sum_{i=1}^N \rho_i C_i^T \left( \mb{z}^{(k)}_i -
+            \mb{z}^{(k-1)}_i \right) \right\|_2 \;.
+
+        Returns:
+            Norm of dual residual.
+
+        """
+        # TODO: Check if this is measured correctly.
+        dual_residual = 0
+        for i in range(self.N):
+            dual_residual = jax.device_put(dual_residual, self.device_list[i])
+            dual_residual += self.A_list[i].T(self.z_list[i] - self.z_list_prev[i])
+        dual_residual = jax.device_put(dual_residual, self.device_list[0])
+        dual_residual = self._global_sum(dual_residual)
+        return snp.linalg.norm(dual_residual)
+
+    def x_difference(self) -> float:
+        total_change = 0
+        for i in range(self.N):
+            total_change = jax.device_put(total_change, self.device_list[i])
+            change = snp.linalg.norm(self.x_list[i] - self.x_list_prev[i]) ** 2
+            total_change += change
+        total_change = jax.device_put(total_change, self.device_list[0])
+        return self._global_sum(total_change)
+
+    def step(self):
+        r"""Perform a single proximal Jacobi ADMM iteration.
+
+        The primary variable :math:`\mb{x}` is updated by solving the the
+        optimization problem
+
+        .. math::
+            \mb{x}^{(k+1)} = \argmin_{x_i} \|x_i\|_1 + 
+            \left\langle \rho A_i^T \left( Ax^k - y - \frac{\lambda^k}{\rho} \right), x_i \right\rangle 
+            + \frac{\tau_i}{2} \|x_i - x^k_i\|_2^2\;.
+
+        Update the scaled Lagrange multipliers :math:`\mb{\lambda}_i` according to
+
+        .. math::
+            \mb{\lambda}_i^{(k+1)} =  \mb{\lambda}_i^{(k)} - \gamma \rho_i (\sum_{i=1}^N A_i x^k - y)\;.
+        """
+        # Store the previous two iterations' x, dual variable λ, and residual.
+        self.x_list_prev_prev = self.x_list_prev.copy()
+        self.x_list_prev = self.x_list.copy()
+        self.Ax_list_prev_prev = self.Ax_list_prev.copy()
+        self.Ax_list_prev = self.Ax_list.copy()
+        self.λ_list_prev_prev = self.λ_list_prev.copy()
+        self.λ_list_prev = self.λ_list.copy()
+        self.z_list_prev_prev = self.z_list_prev.copy()
+        self.z_list_prev = self.z_list.copy()
+
+        # Update the predicted sinogram \sum_{i=1}^N A_ix_i for proximal Jacobi ADMM update.
+        self.Ax_update()
+        # Update each of the x_i in parallel using JIT-compiled functions.
+        # for i in range(self.N):
+        #     self.x_update(i)
+        # jax.block_until_ready(self.x_list)
+        self.x_update_parallel()
+        # Update the predicted sinogram \sum_{i=1}^N A_ix_i again, so that the z-update is Gauss-Seidel.
+        self.Ax_update()
+        # Update the auxilliary indicator variable z
+        self.z_update()
+
+        # Update dual variable λ
+        residual = self.Ax_list[0] - self.z_list[0]
+        self.λ_list = [
+            λ - self.γ * self.ρ * jax.device_put(residual, device)
+            for λ, device in zip(self.λ_list, self.device_list)
+        ]
+
+        # Compute 2/gamma*(lambda^k-lambda^{k+1})'*A(x^k-x^{k+1})
+        cross_term = 2 / self.γ * snp.dot((self.λ_list_prev[0] - self.λ_list[0]).reshape(-1), (self.Ax_list_prev[0] - self.Ax_list[0]).reshape(-1))
+        # Compute ||x^k-x^{k+1}||^2_G
+        dx_norm = 0
+        for i in range(self.N):
+            diff = (self.x_list[i] - self.x_list_prev[i]).reshape(-1)
+            # Move the norm computation result to device 0 before adding to dx_norm
+            norm_squared = snp.linalg.norm(diff)**2 * self.τ
+            norm_squared = jax.device_put(norm_squared, self.device_list[0])
+            dx_norm += norm_squared
+        # Match global PJADMM: ||x^k-x^{k+1}||^2_G sums over all blocks on all processes.
+        dx_norm = self._global_sum(dx_norm)
+        # Compute (2-gamma)/(rho*gamma^2)*||lambda^k-lambda^{k+1}||^2
+        d_lambda_norm = (2 - self.γ) / (self.ρ * self.γ**2) * snp.linalg.norm(self.λ_list[0] - self.λ_list_prev[0])**2
+        # Compute the lower bound of error decrease: h(u^k,u^{k+1})
+        lower_bound = dx_norm + d_lambda_norm + cross_term
+
+        # if lower_bound < 0, double τ to ensure convergence:
+        if lower_bound < 0:
+            print("τ is doubled at iteration ", self.itnum)
+            self.τ = self.τ * 2
+            # Revert back the variables.
+            self.λ_list = self.λ_list_prev.copy()
+            self.λ_list_prev = self.λ_list_prev_prev.copy()
+            self.x_list = self.x_list_prev.copy()
+            self.x_list_prev = self.x_list_prev_prev.copy()
+            self.Ax_list = self.Ax_list_prev.copy()
+            self.Ax_list_prev = self.Ax_list_prev_prev.copy()
+            self.z_list = self.z_list_prev.copy()
+            self.z_list_prev = self.z_list_prev_prev.copy()
+        elif self.itnum % 10 == 0 and self.tau_decrease:
+            # Decrase τ after every a pre-defined number of iterations.
+            self.τ = self.τ / 1.2
+
+    def save_solution(self, itnum: int):
+        """Save the solution at the current iteration."""
+        self.x_list = self.minimizer()
+        self.save_path = os.path.join(self.save_path, f"iteration_{itnum}.npy")
+        snp.save(self.save_path, self.x_list)
+
+    def solve(
+        self,
+        callback: Optional[Callable[[Optimizer], None]] = None,
+    ) -> Union[Array, BlockArray]:
+        r"""Initialize and run the optimization algorithm.
+
+        Initialize and run the opimization algorithm for a total of
+        `self.maxiter` iterations.
+
+        Args:
+            callback: An optional callback function, taking an a single
+              argument of type :class:`Optimizer`, that is called
+              at the end of every iteration.
+
+        Returns:
+            Computed solution.
+        """
+        self.timer.start()
+        for self.itnum in range(self.itnum, self.itnum + self.maxiter):
+            self.step()
+            if self.nanstop and not self._working_vars_finite():
+                raise ValueError(
+                    f"NaN or Inf value encountered in working variable in iteration {self.itnum}."
+                    ""
+                )
+            self.itstat_object.insert(self.itstat_insert_func(self))
+            # TODO: Implement saving solution during the optimization process.
+            # if self.save_period is not None and self.itnum % self.save_period == 0:
+            #     self.save_solution(self.itnum)
+            if callback:
+                self.timer.stop()
+                callback(self)
+                self.timer.start()
+
+        self.timer.stop()
+        self.itstat_object.end()
+        
+        return self.minimizer()

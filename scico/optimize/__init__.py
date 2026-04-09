@@ -28,6 +28,7 @@ from ._semipjadmm_parallel_indicator import ParallelSemiProxJacobiADMMIndicator
 from ._semipjadmm_parallel_l2_plus_reg import ParallelSemiProxJacobiADMML2PlusReg
 from ._semipjadmm_parallel_l2_plus_reg_iterative_reg import ParallelSemiProxJacobiADMML2PlusRegIterativeReg
 from ._semipjadmm_parallel_l2_plus_reg_iterative_reg_estimated_pdhg import ParallelSemiProxJacobiADMML2PlusRegIterativeRegEstimatedPDHG
+from ._semipjadmm_parallel_l2_plus_reg_iterative_reg_estimated_pdhg_multinode import ParallelSemiProxJacobiADMML2PlusRegIterativeRegEstimatedPDHGMultinode
 
 __all__ = [
     "ADMM",
@@ -51,6 +52,7 @@ __all__ = [
     "ParallelSemiProxJacobiADMML2PlusReg",
     "ParallelSemiProxJacobiADMML2PlusRegIterativeReg",
     "ParallelSemiProxJacobiADMML2PlusRegIterativeRegEstimatedPDHG",
+    "ParallelSemiProxJacobiADMML2PlusRegIterativeRegEstimatedPDHGMultinode",
 ]
 
 # Imported items in __all__ appear to originate in top-level linop module

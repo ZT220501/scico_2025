@@ -31,6 +31,11 @@ try:
 except ImportError:
     raise ImportError("Could not import mbirjax; please install it.")
 
+
+def _local_cpu_device():
+    """Return an addressable CPU device for the current JAX process."""
+    return jax.local_devices(backend="cpu")[0]
+
 class XRayTransformParallel(LinearOperator):
     r"""Parallel beam X-ray transform based on mbirjax.
 
@@ -118,6 +123,16 @@ class XRayTransformParallel(LinearOperator):
         # Convert the sinogram to the mbirjax convention.
         y_device = y.device         # Store the device of the sinogram for GPU fbp reconstruction.
         y = jax.device_put(y.transpose(1, 0, 2), y_device)
+        # Ensure mbirjax uses devices addressable from this host process.
+        if device == 'cpu':
+            local_cpu = _local_cpu_device()
+            self.model.main_device = local_cpu
+            self.model.sinogram_device = local_cpu
+            self.model.worker = local_cpu
+        else:
+            self.model.main_device = y_device
+            self.model.sinogram_device = y_device
+            self.model.worker = y_device
         view_batch_size = len(self.model.get_params("angles"))
         # Create the filtered sinogram, in the mbirjax convention.
         filtered_sinogram = self.model.fbp_filter(y, filter_name="ramp", view_batch_size=view_batch_size)
@@ -125,7 +140,7 @@ class XRayTransformParallel(LinearOperator):
         # By default, the filtered back projection is performed on the CPU instead of the GPU to avoid memory constraints.
         # This will be served as the initial guess for the block proximal Jacobi ADMM solver.
         if device == 'cpu':
-            filtered_sinogram = jax.device_put(filtered_sinogram, jax.devices('cpu')[0])    # Put the filtered sinogram on the CPU to avoid memory constraints.
+            filtered_sinogram = jax.device_put(filtered_sinogram, _local_cpu_device())    # Put the filtered sinogram on the CPU to avoid memory constraints.
             recon = self._bproj(filtered_sinogram, self.indices, self.model.get_params("angles"), self.projector_params, coeff_power=1, device='cpu')
         else:
             filtered_sinogram = jax.device_put(filtered_sinogram, y_device)
@@ -190,7 +205,8 @@ class XRayTransformParallel(LinearOperator):
         input_shape = projector_params.recon_roi_shape
         input_shape = (input_shape[2], input_shape[1], input_shape[0])
         if device == 'cpu':
-            with jax.default_device(jax.devices('cpu')[0]):
+            local_cpu = _local_cpu_device()
+            with jax.default_device(local_cpu):
                 recon = snp.zeros((input_shape[0] * input_shape[1], input_shape[2]))
         else:
             recon = snp.zeros((input_shape[0] * input_shape[1], input_shape[2]))
@@ -198,7 +214,8 @@ class XRayTransformParallel(LinearOperator):
         # Generate the sinogram for each angle, with the desired pixel indices.
         # Stack all the views into a single sinogram.
         if device == 'cpu':
-            with jax.default_device(jax.devices('cpu')[0]):
+            local_cpu = _local_cpu_device()
+            with jax.default_device(local_cpu):
                 for i in range(len(angles)):
                     recon_cylinder = XRayTransformParallel.back_project_one_view_to_pixel_batch(
                         sinogram[:, i, :],
@@ -207,7 +224,7 @@ class XRayTransformParallel(LinearOperator):
                         projector_params,
                         coeff_power=coeff_power,
                     )
-                    recon += jax.device_put(recon_cylinder, jax.devices('cpu')[0])
+                    recon += jax.device_put(recon_cylinder, local_cpu)
                 # Transpose the reconstructed 3D image to match the scico convention.
                 recon = recon.reshape(input_shape)
                 recon = recon.transpose(2, 1, 0)
@@ -294,15 +311,16 @@ class XRayTransformParallel(LinearOperator):
 
         # Get the data needed for horizontal projection, and put everything on the CPU.
         n_p, n_p_center, W_p_c, cos_alpha_p_xy = mbirjax.ParallelBeamModel.compute_proj_data(pixel_indices, angle, projector_params)
-        n_p = jax.device_put(n_p, jax.devices('cpu')[0])
-        n_p_center = jax.device_put(n_p_center, jax.devices('cpu')[0])
-        W_p_c = jax.device_put(W_p_c, jax.devices('cpu')[0])
-        cos_alpha_p_xy = jax.device_put(cos_alpha_p_xy, jax.devices('cpu')[0])
+        local_cpu = _local_cpu_device()
+        n_p = jax.device_put(n_p, local_cpu)
+        n_p_center = jax.device_put(n_p_center, local_cpu)
+        W_p_c = jax.device_put(W_p_c, local_cpu)
+        cos_alpha_p_xy = jax.device_put(cos_alpha_p_xy, local_cpu)
 
         L_max = jnp.minimum(1.0, W_p_c)
-        L_max = jax.device_put(L_max, jax.devices('cpu')[0])
+        L_max = jax.device_put(L_max, local_cpu)
 
-        with jax.default_device(jax.devices('cpu')[0]):
+        with jax.default_device(local_cpu):
             # Allocate the voxel cylinder array
             det_voxel_cylinder = jnp.zeros((num_pixels, num_det_rows))
             # jax.debug.breakpoint(num_frames=1)
